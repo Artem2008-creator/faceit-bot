@@ -1,14 +1,11 @@
 """
 Telegram-бот: анализ слабого игрока в матче Faceit CS2 по ссылке на матч.
-
-Деплой на Render.com: вебхук на /webhook, встроенный HTTP-сервер python-telegram-bot.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -22,10 +19,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 # --- Настройки (подставьте свои значения) ---
 BOT_TOKEN = "8991957878:AAFbRWDYwMCZhL3PSkVbVSGJ-VQF6rNWn60"
 FACEIT_API_KEY = "a09ba37e-31db-4566-9611-abce349660aa"
-# URL на Render (опционально). На Render обычно задаётся переменной окружения RENDER_EXTERNAL_URL
-RENDER_EXTERNAL_URL = ""
 
-WEBHOOK_PATH = "webhook"
 FACEIT_API_BASE = "https://open.faceit.com/data/v4"
 REQUEST_TIMEOUT = 20
 
@@ -325,54 +319,15 @@ def build_application() -> Application:
     return application
 
 
-def get_public_url() -> str:
-    """Публичный URL: сначала из окружения Render, иначе из константы в коде."""
-    return (os.environ.get("RENDER_EXTERNAL_URL") or RENDER_EXTERNAL_URL or "").strip()
-
-
-async def run_polling_bot(application: Application) -> None:
-    """Long polling для локального запуска (без публичного URL)."""
-    logger.info("Бот запущен (long polling)")
-    async with application:
-        await application.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-        )
-        await application.start()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            await application.updater.stop()
-            await application.stop()
-
-
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Укажите BOT_TOKEN в начале файла bot.py")
 
     application = build_application()
-    public_url = get_public_url()
-    port = int(os.environ.get("PORT", "10000"))
-
-    if public_url:
-        webhook_url = f"{public_url.rstrip('/')}/{WEBHOOK_PATH}"
-        logger.info("Бот запущен (webhook): %s, порт %s", webhook_url, port)
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=WEBHOOK_PATH,
-            webhook_url=webhook_url,
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
-    else:
-        logger.info(
-            "RENDER_EXTERNAL_URL не задан — long polling (локальный режим)"
-        )
-        try:
-            asyncio.run(run_polling_bot(application))
-        except KeyboardInterrupt:
-            logger.info("Бот остановлен")
+    logger.info("Бот запущен (long polling)")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     main()
+
