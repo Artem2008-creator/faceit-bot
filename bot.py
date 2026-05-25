@@ -32,6 +32,8 @@ HEALTH_PORT = 10000
 RECENT_MAP_MATCHES_LIMIT = 15
 GAME_STATS_FETCH_LIMIT = 40
 MIN_MAP_MATCHES_FOR_SKILL = 3
+RECENT_TEAM_MATCHES = 10
+MAP_POOL_TOP_N = 2
 
 MATCH_ID_PATTERN = re.compile(
     r"(1-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
@@ -219,6 +221,50 @@ class AnalyzedPlayer:
     skill: MapSkill
     site: str
     site_source: str
+
+
+@dataclass
+class MapPoolEntry:
+    map_key: str
+    display_name: str
+    wins: int
+    played: int
+
+    @property
+    def win_rate(self) -> float:
+        if self.played == 0:
+            return 0.0
+        return self.wins / self.played * 100
+
+
+@dataclass
+class MapPoolAnalysis:
+    entries: list[MapPoolEntry]
+
+    @property
+    def worst(self) -> list[MapPoolEntry]:
+        if not self.entries:
+            return []
+        return sorted(self.entries, key=lambda e: (e.win_rate, e.played))[:MAP_POOL_TOP_N]
+
+    @property
+    def best(self) -> list[MapPoolEntry]:
+        if not self.entries:
+            return []
+        return sorted(
+            self.entries, key=lambda e: (-e.win_rate, -e.played)
+        )[:MAP_POOL_TOP_N]
+
+
+@dataclass
+class AnalysisResult:
+    map_name: str
+    map_key: str
+    players: list[AnalyzedPlayer]
+    team_avg: MapSkill
+    weakest: AnalyzedPlayer
+    strongest: AnalyzedPlayer
+    map_pool: MapPoolAnalysis | None
 
 
 class FaceitService:
@@ -589,22 +635,170 @@ def skill_sort_key(player: AnalyzedPlayer) -> tuple[float, float, float]:
     return (s.kd_ratio, s.adr, s.hs_pct)
 
 
+def average_team_skill(players: list[AnalyzedPlayer]) -> MapSkill:
+    count = len(players)
+    return MapSkill(
+        kd_ratio=sum(p.skill.kd_ratio for p in players) / count,
+        adr=sum(p.skill.adr for p in players) / count,
+        hs_pct=sum(p.skill.hs_pct for p in players) / count,
+    )
+
+
+def player_tier_emoji(
+    player: AnalyzedPlayer,
+    weakest: AnalyzedPlayer,
+    strongest: AnalyzedPlayer,
+) -> str:
+    if player.player_id == weakest.player_id:
+        return "🔴"
+    if player.player_id == strongest.player_id:
+        return "🟢"
+    return "🟡"
+
+
+def parse_match_win(stats: dict[str, Any]) -> bool | None:
+    result = _first_present(stats, ("Result", "result", "Win"))
+    if result is None:
+        return None
+    if isinstance(result, bool):
+        return result
+    text = str(result).strip().lower()
+    if text in ("1", "win", "w", "true", "yes"):
+        return True
+    if text in ("0", "loss", "l", "false", "no"):
+        return False
+    try:
+        return int(float(text)) == 1
+    except ValueError:
+        return None
+
+
+def collect_opponent_recent_matches(
+    service: FaceitService, player_ids: list[str], limit: int = RECENT_TEAM_MATCHES
+) -> list[tuple[str, dict[str, Any]]]:
+    """Уникальные последние матчи соперников (match_id, item из game stats)."""
+    seen: set[str] = set()
+    ordered: list[tuple[str, dict[str, Any]]] = []
+
+    for player_id in player_ids:
+        if len(ordered) >= limit:
+            break
+        try:
+            payload = service.get_player_game_stats(player_id, limit=limit)
+        except (FaceitNotFoundError, FaceitAPIError):
+            continue
+        for item in payload.get("items") or []:
+            match_id = item.get("match_id")
+            if not match_id or match_id in seen:
+                continue
+            seen.add(match_id)
+            ordered.append((match_id, item))
+            if len(ordered) >= limit:
+                break
+
+    return ordered
+
+
+def analyze_opponent_map_pool(
+    service: FaceitService, player_ids: list[str]
+) -> MapPoolAnalysis | None:
+    """Винрейт по картам за последние RECENT_TEAM_MATCHES матчей соперников."""
+    pool: dict[str, dict[str, int]] = {}
+
+    for match_id, item in collect_opponent_recent_matches(service, player_ids):
+        try:
+            match_stats = service.get_match_stats(match_id)
+        except (FaceitNotFoundError, FaceitAPIError):
+            continue
+
+        map_key = normalize_map_key(get_map_from_stats(match_stats))
+        if not map_key:
+            continue
+
+        won: bool | None = None
+        for player_id in player_ids:
+            pstats = extract_player_match_stats(match_stats, player_id)
+            if pstats:
+                won = parse_match_win(pstats)
+                break
+        if won is None:
+            item_stats = item.get("stats")
+            if isinstance(item_stats, dict):
+                won = parse_match_win(item_stats)
+        if won is None:
+            continue
+
+        bucket = pool.setdefault(map_key, {"wins": 0, "played": 0})
+        bucket["played"] += 1
+        if won:
+            bucket["wins"] += 1
+
+    if not pool:
+        return None
+
+    entries = [
+        MapPoolEntry(
+            map_key=map_key,
+            display_name=format_map_name(map_key),
+            wins=data["wins"],
+            played=data["played"],
+        )
+        for map_key, data in pool.items()
+    ]
+    return MapPoolAnalysis(entries=entries)
+
+
+def pick_attack_advice(
+    players: list[AnalyzedPlayer], team_avg: MapSkill
+) -> tuple[str, list[str]]:
+    """Точка для атаки и ники слабых игроков на ней."""
+    by_site: dict[str, list[AnalyzedPlayer]] = {}
+    for player in players:
+        by_site.setdefault(player.site, []).append(player)
+
+    avg_key = (team_avg.kd_ratio, team_avg.adr, team_avg.hs_pct)
+
+    def site_score(site: str) -> float:
+        members = by_site[site]
+        return sum(skill_sort_key(p)[0] for p in members) / len(members)
+
+    target_site = min(by_site.keys(), key=site_score)
+    weak_players = [
+        p
+        for p in by_site[target_site]
+        if skill_sort_key(p) < avg_key
+    ]
+    if not weak_players:
+        weak_players = [min(by_site[target_site], key=skill_sort_key)]
+
+    return target_site, [p.nickname for p in weak_players]
+
+
+def format_map_pool_line(entries: list[MapPoolEntry]) -> str:
+    if not entries:
+        return "—"
+    return ", ".join(f"{e.display_name} ({e.win_rate:.0f}%)" for e in entries)
+
+
 def analyze_opponents(
     service: FaceitService,
     match_id: str,
     user_nickname: str,
-) -> tuple[str, AnalyzedPlayer, AnalyzedPlayer]:
+) -> AnalysisResult:
     match = service.get_match(match_id)
     map_key = resolve_match_map(service, match_id, match)
     map_name = format_map_name(map_key)
     roster = get_opponent_roster(match, user_nickname)
 
     analyzed: list[AnalyzedPlayer] = []
+    player_ids: list[str] = []
+
     for index, member in enumerate(roster):
         player_id = member.get("player_id")
         nickname = member.get("nickname") or "unknown"
         if not player_id:
             continue
+        player_ids.append(player_id)
         try:
             skill = get_player_map_skill(service, player_id, map_key)
             site, site_source = detect_player_site(service, member, map_key, index)
@@ -627,27 +821,72 @@ def analyze_opponents(
             "Возможно, у них мало игр на ней."
         )
 
-    weakest = min(analyzed, key=skill_sort_key)
-    strongest = max(analyzed, key=skill_sort_key)
-    return map_name, weakest, strongest
+    analyzed.sort(key=skill_sort_key)
+    weakest = analyzed[0]
+    strongest = analyzed[-1]
+    team_avg = average_team_skill(analyzed)
+    map_pool = analyze_opponent_map_pool(service, player_ids)
 
-
-def build_report(
-    map_name: str,
-    weakest: AnalyzedPlayer,
-    strongest: AnalyzedPlayer,
-) -> str:
-    ws, ss = weakest.skill, strongest.skill
-    return (
-        f"🔍 Карта: {map_name}\n"
-        f"🛑 Самый слабый: {weakest.nickname} "
-        f"(K/D: {ws.kd_ratio:.2f}, ADR: {ws.adr:.0f}, HS%: {ws.hs_pct:.0f}%) "
-        f"— точка {weakest.site}\n"
-        f"🟢 Самый сильный: {strongest.nickname} "
-        f"(K/D: {ss.kd_ratio:.2f}, ADR: {ss.adr:.0f}, HS%: {ss.hs_pct:.0f}%) "
-        f"— точка {strongest.site}\n"
-        f"🎯 Совет: Атакуй точку {weakest.site} (слабый: {weakest.nickname})."
+    return AnalysisResult(
+        map_name=map_name,
+        map_key=map_key,
+        players=analyzed,
+        team_avg=team_avg,
+        weakest=weakest,
+        strongest=strongest,
+        map_pool=map_pool,
     )
+
+
+def build_report(result: AnalysisResult) -> str:
+    avg = result.team_avg
+    lines = [
+        f"🔍 Карта: {result.map_name}",
+        "",
+        f"📊 Среднее по команде: K/D {avg.kd_ratio:.2f} | ADR {avg.adr:.0f} | "
+        f"HS% {avg.hs_pct:.0f}%",
+        "",
+        "👥 Команда соперника:",
+    ]
+
+    for player in result.players:
+        skill = player.skill
+        emoji = player_tier_emoji(player, result.weakest, result.strongest)
+        lines.append(
+            f"{emoji} {player.nickname} — {player.site} "
+            f"(K/D: {skill.kd_ratio:.2f}, ADR: {skill.adr:.0f}, HS%: {skill.hs_pct:.0f}%)"
+        )
+
+    attack_site, weak_names = pick_attack_advice(result.players, result.team_avg)
+    lines.extend(
+        [
+            "",
+            f"🎯 Совет: Атакуй точку {attack_site} (слабые: {', '.join(weak_names)})",
+        ]
+    )
+
+    if result.map_pool and result.map_pool.entries:
+        worst = result.map_pool.worst
+        best = result.map_pool.best
+        lines.extend(
+            [
+                "",
+                f"📉 Худшие карты соперника: {format_map_pool_line(worst)}",
+                f"📈 Лучшие карты: {format_map_pool_line(best)}",
+                f"⚠️ Баньте: {', '.join(e.display_name for e in worst) or '—'}",
+                f"✅ Оставляйте: {', '.join(e.display_name for e in best) or '—'}",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "📉 Худшие карты соперника: недостаточно данных",
+                "📈 Лучшие карты: недостаточно данных",
+            ]
+        )
+
+    return "\n".join(lines)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -721,10 +960,8 @@ async def handle_match_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     def run_analysis() -> str:
         service = FaceitService(FACEIT_API_KEY)
-        map_name, weakest, strongest = analyze_opponents(
-            service, match_id, user_nickname
-        )
-        return build_report(map_name, weakest, strongest)
+        result = analyze_opponents(service, match_id, user_nickname)
+        return build_report(result)
 
     try:
         report = await asyncio.to_thread(run_analysis)
