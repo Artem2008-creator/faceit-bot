@@ -7,7 +7,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import threading
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import requests
@@ -20,6 +22,7 @@ FACEIT_API_KEY = "3fc0c069-7c26-46bb-a478-bed79cb95894"
 
 FACEIT_API_BASE = "https://open.faceit.com/data/v4"
 REQUEST_TIMEOUT = 20
+HEALTH_PORT = 10000
 
 # ID матча Faceit: префикс 1- и UUID
 MATCH_ID_PATTERN = re.compile(
@@ -401,6 +404,30 @@ async def handle_match_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    """Простой health check для Render (GET / → 200 OK)."""
+
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        logger.debug("Health %s - %s", self.address_string(), format % args)
+
+
+def run_health_server() -> None:
+    server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
+    logger.info("HTTP health check на порту %s (GET / → OK)", HEALTH_PORT)
+    server.serve_forever()
+
+
 def build_application() -> Application:
     """Создаёт Application и регистрирует обработчики."""
     application = Application.builder().token(BOT_TOKEN).build()
@@ -414,6 +441,13 @@ def build_application() -> Application:
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Укажите BOT_TOKEN в начале файла bot.py")
+
+    health_thread = threading.Thread(
+        target=run_health_server,
+        name="health-http",
+        daemon=True,
+    )
+    health_thread.start()
 
     application = build_application()
     logger.info("Бот запущен (long polling)")
