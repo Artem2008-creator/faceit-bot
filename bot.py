@@ -16,7 +16,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 # --- Настройки (подставьте свои значения) ---
 BOT_TOKEN = "8991957878:AAFbRWDYwMCZhL3PSkVbVSGJ-VQF6rNWn60"
-FACEIT_API_KEY = "a09ba37e-31db-4566-9611-abce349660aa"
+FACEIT_API_KEY = "3fc0c069-7c26-46bb-a478-bed79cb95894"
 
 FACEIT_API_BASE = "https://open.faceit.com/data/v4"
 REQUEST_TIMEOUT = 20
