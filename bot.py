@@ -10,9 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-import faceit
 import requests
-from faceit.exceptions import APIError, NotFoundError
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -42,11 +40,29 @@ MAP_DISPLAY_NAMES: dict[str, str] = {
     "de_cache": "Cache",
 }
 
+# Ключи lifetime-статистики CS2 в Data API
+STAT_WIN_RATE_KEYS = ("Win Rate %", "Win Rate", "win_rate")
+STAT_KD_KEYS = ("Average K/D Ratio", "K/D Ratio", "Average K/D", "kd_ratio")
+STAT_ELO_KEYS = ("Current Elo", "Elo", "faceit_elo", "Average Elo")
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+class FaceitAPIError(Exception):
+    """Ошибка Faceit Data API."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+class FaceitNotFoundError(FaceitAPIError):
+    """Ресурс не найден (HTTP 404)."""
 
 
 @dataclass
@@ -57,24 +73,16 @@ class AnalyzedPlayer:
     player_id: str
     elo: int
     win_rate: float
+    kd_ratio: float
 
 
 class FaceitService:
-    """Работа с Faceit: HTTP через requests, профили — через библиотеку faceit."""
+    """Работа с Faceit Data API v4 через requests."""
 
     def __init__(self, api_key: str) -> None:
         self._headers = {"Authorization": f"Bearer {api_key}"}
-        self._data = faceit.SyncDataResource(api_key)
-
-    def __enter__(self) -> FaceitService:
-        self._data.__enter__()
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        self._data.__exit__(*args)
 
     def _request(self, method: str, path: str) -> dict[str, Any]:
-        """Вызов Data API Faceit через requests."""
         url = f"{FACEIT_API_BASE}{path}"
         try:
             response = requests.request(
@@ -89,10 +97,16 @@ class FaceitService:
             ) from exc
 
         if response.status_code == 404:
-            raise NotFoundError()
+            raise FaceitNotFoundError("Ресурс не найден", status_code=404)
+        if response.status_code == 401:
+            raise FaceitAPIError(
+                "Неверный API-ключ Faceit (invalid_token). "
+                "Проверьте FACEIT_API_KEY на developers.faceit.com",
+                status_code=401,
+            )
         if response.status_code >= 400:
             detail = response.text[:200] or f"HTTP {response.status_code}"
-            raise APIError(message=detail)
+            raise FaceitAPIError(detail, status_code=response.status_code)
 
         return response.json()
 
@@ -100,17 +114,65 @@ class FaceitService:
         return self._request("GET", f"/matches/{match_id}")
 
     def get_match_stats(self, match_id: str) -> dict[str, Any]:
+        """Статистика матча — запасной источник названия карты."""
         return self._request("GET", f"/matches/{match_id}/stats")
 
-    def get_player_elo_and_winrate(self, player_id: str) -> tuple[int, float]:
-        """ELO и общий винрейт CS2 из профиля через библиотеку faceit."""
-        player = self._data.players.get(player_id)
-        cs2 = player.games.get(faceit.GameID.CS2)
-        if cs2 is None:
-            raise ValueError(f"У игрока {player.nickname} нет привязки CS2")
+    def get_player_cs2_stats(self, player_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/players/{player_id}/stats/cs2")
 
-        stats = self._data.players.stats(player.id, faceit.GameID.CS2)
-        return int(cs2.elo), float(stats.lifetime.win_rate)
+    def get_player_cs2_elo(self, player_id: str) -> int | None:
+        """ELO из профиля игрока, если в stats/cs2 нет поля Elo."""
+        try:
+            player = self._request("GET", f"/players/{player_id}")
+        except FaceitNotFoundError:
+            return None
+        games = player.get("games") or {}
+        cs2 = games.get("cs2") or games.get("csgo")
+        if not cs2:
+            return None
+        elo = cs2.get("faceit_elo")
+        return int(elo) if elo is not None else None
+
+    def get_player_elo_winrate_kd(self, player_id: str) -> tuple[int, float, float]:
+        stats = self.get_player_cs2_stats(player_id)
+        lifetime = stats.get("lifetime") or {}
+
+        win_rate = _parse_percent(_first_present(lifetime, STAT_WIN_RATE_KEYS))
+        kd_ratio = _parse_float(_first_present(lifetime, STAT_KD_KEYS))
+
+        elo_raw = _first_present(lifetime, STAT_ELO_KEYS)
+        elo = int(_parse_float(elo_raw)) if elo_raw is not None else None
+        if elo is None:
+            elo = self.get_player_cs2_elo(player_id)
+        if elo is None:
+            raise ValueError(f"Не удалось получить ELO игрока {player_id}")
+
+        if win_rate is None:
+            raise ValueError(f"Не удалось получить винрейт игрока {player_id}")
+
+        return elo, win_rate, kd_ratio if kd_ratio is not None else 0.0
+
+
+def _first_present(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+    return None
+
+
+def _parse_float(value: Any) -> float:
+    if value is None:
+        raise ValueError("пустое значение")
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("%", "").replace(",", ".")
+    return float(text)
+
+
+def _parse_percent(value: Any) -> float | None:
+    if value is None:
+        return None
+    return _parse_float(value)
 
 
 def extract_match_id(text: str) -> str | None:
@@ -142,6 +204,32 @@ def format_map_name(raw_map: str | None) -> str:
     if key.startswith("de_"):
         return key[3:].replace("_", " ").title()
     return raw_map.replace("_", " ").title()
+
+
+def get_map_from_match(match: dict[str, Any]) -> str | None:
+    """Карта из voting матча (pick) или из entity guid."""
+    voting = match.get("voting")
+    if not voting:
+        return None
+
+    maps_block = voting.get("map") or voting.get("maps")
+    if not maps_block:
+        return None
+
+    pick = maps_block.get("pick")
+    if isinstance(pick, list) and pick:
+        return str(pick[0])
+    if isinstance(pick, str):
+        return pick
+
+    entities = maps_block.get("entities") or []
+    if entities:
+        entity = entities[0]
+        if isinstance(entity, dict):
+            return entity.get("game_map_name") or entity.get("name") or entity.get("guid")
+        return str(entity)
+
+    return None
 
 
 def get_map_from_stats(stats: dict[str, Any]) -> str | None:
@@ -184,7 +272,6 @@ def get_opponent_roster(
         )
         return team_list[opponent_index].get("roster") or []
 
-    # Без ника: вторая команда в ответе API считается соперником
     return team_list[1].get("roster") or []
 
 
@@ -194,8 +281,13 @@ def analyze_opponents(
     user_nickname: str | None,
 ) -> tuple[str, AnalyzedPlayer, AnalyzedPlayer]:
     match = service.get_match(match_id)
-    stats_payload = service.get_match_stats(match_id)
-    map_name = format_map_name(get_map_from_stats(stats_payload))
+    raw_map = get_map_from_match(match)
+    if not raw_map:
+        try:
+            raw_map = get_map_from_stats(service.get_match_stats(match_id))
+        except (FaceitNotFoundError, FaceitAPIError):
+            pass
+    map_name = format_map_name(raw_map)
 
     roster = get_opponent_roster(match, user_nickname)
     if not roster:
@@ -208,8 +300,8 @@ def analyze_opponents(
         if not player_id:
             continue
         try:
-            elo, win_rate = service.get_player_elo_and_winrate(player_id)
-        except (NotFoundError, APIError, ValueError) as exc:
+            elo, win_rate, kd_ratio = service.get_player_elo_winrate_kd(player_id)
+        except (FaceitNotFoundError, FaceitAPIError, ValueError) as exc:
             logger.warning("Пропуск игрока %s: %s", nickname, exc)
             continue
         analyzed.append(
@@ -218,14 +310,15 @@ def analyze_opponents(
                 player_id=player_id,
                 elo=elo,
                 win_rate=win_rate,
+                kd_ratio=kd_ratio,
             )
         )
 
     if not analyzed:
         raise ValueError("Не удалось получить статистику ни одного игрока соперника")
 
-    weakest = min(analyzed, key=lambda p: (p.win_rate, p.elo))
-    strongest = max(analyzed, key=lambda p: (p.win_rate, p.elo))
+    weakest = min(analyzed, key=lambda p: (p.win_rate, p.elo, p.kd_ratio))
+    strongest = max(analyzed, key=lambda p: (p.win_rate, p.elo, p.kd_ratio))
     return map_name, weakest, strongest
 
 
@@ -253,7 +346,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "• только ссылка — анализ второй команды в матче;\n"
         "• ссылка и твой ник — анализ команды соперников.\n\n"
         "Пример:\n"
-        "https://www.faceit.com/ru/cs2/room/1/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n"
+        "https://www.faceit.com/ru/cs2/room/1-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n"
         "или та же ссылка и через пробел твой никнейм Faceit."
     )
 
@@ -272,34 +365,33 @@ async def handle_match_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not match_id:
         await update.message.reply_text(
             "❌ Неверная ссылка. Пришлите URL матча Faceit CS2 "
-            "(например, faceit.com/.../cs2/room/1/...)."
+            "(например, faceit.com/.../cs2/room/1-...)."
         )
         return
 
     status_message = await update.message.reply_text("⏳ Анализирую матч...")
 
     def run_analysis() -> str:
-        with FaceitService(FACEIT_API_KEY) as service:
-            map_name, weakest, strongest = analyze_opponents(
-                service,
-                match_id,
-                user_nickname,
-            )
-            return build_report(map_name, weakest, strongest)
+        service = FaceitService(FACEIT_API_KEY)
+        map_name, weakest, strongest = analyze_opponents(
+            service,
+            match_id,
+            user_nickname,
+        )
+        return build_report(map_name, weakest, strongest)
 
     try:
         report = await asyncio.to_thread(run_analysis)
         await status_message.edit_text(report)
-    except NotFoundError:
+    except FaceitNotFoundError:
         await status_message.edit_text(
             "❌ Матч не найден. Проверьте ссылку и что матч уже создан на Faceit."
         )
     except ConnectionError as exc:
         await status_message.edit_text(f"❌ {exc}")
-    except APIError as exc:
-        await status_message.edit_text(
-            f"❌ Ошибка Faceit API [{exc.status_code}]: {exc.message}"
-        )
+    except FaceitAPIError as exc:
+        code = f" [{exc.status_code}]" if exc.status_code else ""
+        await status_message.edit_text(f"❌ Ошибка Faceit API{code}: {exc.message}")
     except ValueError as exc:
         await status_message.edit_text(f"❌ {exc}")
     except Exception:
@@ -330,4 +422,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
