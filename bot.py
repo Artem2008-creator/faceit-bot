@@ -8,6 +8,7 @@ import asyncio
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -16,7 +17,10 @@ import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from user_nicks import UserNickStore
+# telegram_user_id → faceit nickname (только в памяти, сбрасывается при перезапуске)
+user_nicks: dict[int, str] = {}
+user_last_active: dict[int, float] = {}
+NICK_INACTIVE_DAYS = 7
 
 # --- Настройки (подставьте свои значения) ---
 BOT_TOKEN = "8991957878:AAFbRWDYwMCZhL3PSkVbVSGJ-VQF6rNWn60"
@@ -174,7 +178,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-user_nick_store = UserNickStore()
+
+def touch_user(user_id: int) -> None:
+    user_last_active[user_id] = time.time()
+
+
+def purge_inactive_users() -> None:
+    """Удаляет ники пользователей, неактивных дольше NICK_INACTIVE_DAYS."""
+    cutoff = time.time() - NICK_INACTIVE_DAYS * 24 * 3600
+    expired = [uid for uid, ts in user_last_active.items() if ts < cutoff]
+    for uid in expired:
+        user_nicks.pop(uid, None)
+        user_last_active.pop(uid, None)
+    if expired:
+        logger.info("Удалены неактивные ники: %s", expired)
 
 
 class FaceitAPIError(Exception):
@@ -634,8 +651,10 @@ def build_report(
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    if not update.message or not update.effective_user:
         return
+    purge_inactive_users()
+    touch_user(update.effective_user.id)
     await update.message.reply_text(
         "Привет! Я анализирую матчи Faceit CS2.\n\n"
         "1. Задай свой ник: /setnick ТвойНик\n"
@@ -660,7 +679,10 @@ async def setnick_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Ник не может быть пустым.")
         return
 
-    user_nick_store.set(update.effective_user.id, nickname)
+    user_id = update.effective_user.id
+    purge_inactive_users()
+    user_nicks[user_id] = nickname
+    touch_user(user_id)
     await update.message.reply_text(
         f"✅ Ник сохранён: {nickname}\n"
         "Теперь отправь ссылку на матч Faceit CS2."
@@ -675,7 +697,11 @@ async def handle_match_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("❌ Не задан FACEIT_API_KEY в bot.py.")
         return
 
-    user_nickname = user_nick_store.get(update.effective_user.id)
+    user_id = update.effective_user.id
+    purge_inactive_users()
+    touch_user(user_id)
+
+    user_nickname = user_nicks.get(user_id)
     if not user_nickname:
         await update.message.reply_text(
             "❌ Сначала укажи свой Faceit-ник командой:\n"
