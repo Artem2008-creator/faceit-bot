@@ -329,6 +329,15 @@ STAT_1V2_COUNT_KEYS = ("1v2Count", "1v2 Count")
 STAT_MATCH_ASSISTS_KEYS = ("Assists",)
 STAT_SNIPER_KILLS_KEYS = ("Sniper Kills",)
 STAT_FLASH_ASSISTS_KEYS = ("Flash Assists", "Flash assists", "Flash Assists Count")
+STAT_CT_WIN_RATE_KEYS = ("CT Win Rate %", "CT Win Rate", "Win Rate CT")
+STAT_CT_ROUNDS_KEYS = ("CT Rounds", "Rounds on CT")
+STAT_CT_ROUNDS_WON_KEYS = ("CT Rounds Won", "CT Rounds won")
+
+FORM_KD_THRESHOLD = 0.05
+FORM_AVG_THRESHOLD = 2.0
+FORM_PCT_THRESHOLD = 3.0
+SERIOUS_DECLINE_PCT = 15.0
+GROWTH_NO_ISSUES_MSG = "Явных зон роста нет, продолжай в том же духе"
 STAT_MAP_MATCHES_KEYS = ("Total Matches", "Matches", "Total matches")
 STAT_PLANTS_KEYS = ("Bomb Plants", "Plants")
 STAT_DEFUSES_KEYS = ("Bomb Defuses", "Defuses")
@@ -2132,6 +2141,17 @@ class PeriodStats:
 
 
 @dataclass
+class GrowthContext:
+    """Данные для ZONE OF GROWTH — причины слабости (не сравнение периодов)."""
+    recent: PeriodStats
+    kd_volatility: float
+    ct_win_rate: float | None
+    hold_rating: float | None
+    worst_map: tuple[str, float, int] | None
+    benchmarks: dict[str, float]
+
+
+@dataclass
 class ProgressReport:
     style: str
     form_score: float
@@ -2139,8 +2159,8 @@ class ProgressReport:
     recent: PeriodStats
     current_elo: int | None
     elo_delta: int | None
-    improved: list[str]
-    declined: list[str]
+    form_lines: list[str]
+    serious_declines: list[str]
     growth_zones: list[str]
     requested_count: int
     match_count: int
@@ -2485,64 +2505,247 @@ def compute_form_score(
     return max(1.0, min(10.0, score))
 
 
-def build_progress_changes(
-    older: PeriodStats, recent: PeriodStats
-) -> tuple[list[str], list[str]]:
-    """Прогресс и просадка без винрейта матчей, с понятными формулировками."""
-    improved: list[tuple[float, str]] = []
-    declined: list[tuple[float, str]] = []
+def _kd_volatility_from_items(items: list[dict[str, Any]]) -> float:
+    kd_values: list[float] = []
+    for item in items:
+        stats = _game_stats_item_stats(item)
+        parsed = parse_map_skill_from_match(stats)
+        if parsed:
+            kd_values.append(parsed[0])
+    if len(kd_values) < 2:
+        return 0.0
+    mean = sum(kd_values) / len(kd_values)
+    variance = sum((value - mean) ** 2 for value in kd_values) / len(kd_values)
+    return variance**0.5
+
+
+def _ct_win_rate_from_items(items: list[dict[str, Any]]) -> float | None:
+    direct_values: list[float] = []
+    rounds_total = 0.0
+    rounds_won = 0.0
+
+    for item in items:
+        stats = _game_stats_item_stats(item)
+        direct = _parse_optional_stat(stats, STAT_CT_WIN_RATE_KEYS)
+        if direct is not None:
+            direct_values.append(_as_percent(direct))
+            continue
+        ct_rounds = _parse_optional_stat(stats, STAT_CT_ROUNDS_KEYS)
+        ct_won = _parse_optional_stat(stats, STAT_CT_ROUNDS_WON_KEYS)
+        if ct_rounds and ct_rounds > 0 and ct_won is not None:
+            rounds_total += ct_rounds
+            rounds_won += ct_won
+
+    if direct_values:
+        return sum(direct_values) / len(direct_values)
+    if rounds_total > 0:
+        return rounds_won / rounds_total * 100
+    return None
+
+
+def _worst_map_from_items(
+    items: list[dict[str, Any]], *, min_matches: int = 3
+) -> tuple[str, float, int] | None:
+    pool: dict[str, dict[str, int]] = {}
+
+    for item in items:
+        stats = _game_stats_item_stats(item)
+        map_key = normalize_map_key(stats.get("Map") or stats.get("map"))
+        if not map_key:
+            continue
+        won = parse_match_win(stats)
+        if won is None:
+            continue
+        bucket = pool.setdefault(map_key, {"wins": 0, "played": 0})
+        bucket["played"] += 1
+        if won:
+            bucket["wins"] += 1
+
+    worst: tuple[str, float, int] | None = None
+    for map_key, data in pool.items():
+        if data["played"] < min_matches:
+            continue
+        win_rate = data["wins"] / data["played"] * 100
+        if worst is None or win_rate < worst[1]:
+            worst = (format_map_name(map_key), win_rate, data["played"])
+
+    return worst
+
+
+def build_growth_context(
+    recent_items: list[dict[str, Any]],
+    recent: PeriodStats,
+    cs2_stats: dict[str, Any],
+    benchmarks: dict[str, float],
+) -> GrowthContext:
+    lifetime = cs2_stats.get("lifetime") or {}
+    hold_rating = compute_hold_rating(lifetime)
+
+    return GrowthContext(
+        recent=recent,
+        kd_volatility=_kd_volatility_from_items(recent_items),
+        ct_win_rate=_ct_win_rate_from_items(recent_items),
+        hold_rating=hold_rating,
+        worst_map=_worst_map_from_items(recent_items),
+        benchmarks=benchmarks,
+    )
+
+
+def find_growth_zones(context: GrowthContext) -> list[str]:
+    """
+    ZONE OF GROWTH: причины слабости (что тянет винрейт вниз), не просадки метрик.
+    Приоритет: первый контакт → клатчи → защита → размены → карта.
+    """
+    recent = context.recent
+    benchmarks = context.benchmarks
+    candidates: list[tuple[int, float, str, str]] = []
+
+    def add(priority: int, severity: float, category: str, detail: str) -> None:
+        candidates.append((priority, severity, category, detail))
+
+    entry_wr = recent.entry_win_rate
+    opening_high = recent.opening_death_rate >= 0.17
+    dies_often = opening_high or (recent.kd < 1.0 and recent.opening_death_rate >= 0.12)
+
+    if entry_wr is not None and entry_wr < 0.45:
+        add(1, 0.45 - entry_wr, "entry", "Первый контакт (низкий entry winrate)")
+    if opening_high:
+        add(1, recent.opening_death_rate, "entry", "Первый контакт (часто умираешь первым)")
+
+    if dies_often and recent.kd < 0.95:
+        if entry_wr is not None and entry_wr < 0.50:
+            add(
+                1,
+                max(0.0, 1.0 - recent.kd),
+                "entry",
+                "Первый контакт (слабые дуэли в начале раунда)",
+            )
+        else:
+            add(
+                4,
+                max(0.0, 0.95 - recent.kd),
+                "trades",
+                "Размены (часто проигрываешь первые контакты)",
+            )
+
+    clutch_wr = recent.clutch_1vx_win_rate
+    if clutch_wr is not None and clutch_wr < 0.35:
+        add(2, 0.35 - clutch_wr, "clutch", "Клатчи 1vX (низкий winrate)")
+
+    if context.kd_volatility >= 0.32:
+        if entry_wr is not None and entry_wr < 0.52:
+            add(
+                1,
+                context.kd_volatility,
+                "entry",
+                "Первый контакт (нестабильность в первых дуэлях)",
+            )
+        elif clutch_wr is not None and clutch_wr < 0.45:
+            add(
+                2,
+                context.kd_volatility,
+                "clutch",
+                "Клатчи 1vX (нестабильность в решающих раундах)",
+            )
+
+    hold_low = context.hold_rating is not None and context.hold_rating < 0.55
+    ct_low = context.ct_win_rate is not None and context.ct_win_rate < 45
+    anchor_losing = (
+        recent.win_rate < 45
+        and recent.opening_death_rate < 0.14
+        and recent.kd >= 0.85
+    )
+
+    if hold_low:
+        add(
+            3,
+            0.55 - (context.hold_rating or 0),
+            "defense",
+            "Защита точки (теряешь много раундов на удержании)",
+        )
+    elif ct_low:
+        add(
+            3,
+            (45 - (context.ct_win_rate or 0)) / 100,
+            "defense",
+            "Защита точки (низкий винрейт за CT)",
+        )
+    elif anchor_losing:
+        add(
+            3,
+            (45 - recent.win_rate) / 100,
+            "defense",
+            "Защита точки (теряешь много раундов на удержании)",
+        )
+
+    if recent.kd < 0.9:
+        add(4, 0.9 - recent.kd, "trades", "Размены (низкий K/D)")
+    elif recent.avg_kills < benchmarks["avg_kills"] * 0.82:
+        add(
+            4,
+            (benchmarks["avg_kills"] - recent.avg_kills) / benchmarks["avg_kills"],
+            "trades",
+            "Размены (мало убийств за матч)",
+        )
+
+    if context.worst_map and context.worst_map[1] < 35:
+        map_name, win_rate, _played = context.worst_map
+        add(
+            5,
+            (35 - win_rate) / 100,
+            "map",
+            f"{map_name} (винрейт {win_rate:.0f}%)",
+        )
+
+    if not candidates:
+        return [GROWTH_NO_ISSUES_MSG]
+
+    candidates.sort(key=lambda item: (item[0], -item[1]))
+    picked: list[str] = []
+    used_categories: set[str] = set()
+
+    for _priority, _severity, category, detail in candidates:
+        if category in used_categories:
+            continue
+        picked.append(detail)
+        used_categories.add(category)
+        if len(picked) >= 2:
+            break
+
+    return picked if picked else [GROWTH_NO_ISSUES_MSG]
+
+
+def build_form_progress(older: PeriodStats, recent: PeriodStats) -> list[str]:
+    """FORM: ты vs ты — только значимые изменения за период."""
+    lines: list[str] = []
+
+    kd_delta = recent.kd - older.kd
+    if abs(kd_delta) > FORM_KD_THRESHOLD:
+        word = "вырос" if kd_delta > 0 else "упал"
+        sign = "+" if kd_delta > 0 else ""
+        lines.append(
+            f"• K/D {word} {sign}{kd_delta:.2f} "
+            f"({older.kd:.2f} → {recent.kd:.2f})"
+        )
 
     avg_delta = recent.avg_kills - older.avg_kills
-    if avg_delta >= 0.5:
-        improved.append(
-            (
-                avg_delta,
-                f"✅ AVG вырос на {avg_delta:.1f} убийств за игру",
-            )
-        )
-    elif avg_delta <= -0.5:
-        declined.append(
-            (
-                -avg_delta,
-                f"⚠️ AVG упал: было {older.avg_kills:.1f} → "
-                f"стало {recent.avg_kills:.1f}",
-            )
+    if abs(avg_delta) > FORM_AVG_THRESHOLD:
+        word = "вырос" if avg_delta > 0 else "упал"
+        sign = "+" if avg_delta > 0 else ""
+        lines.append(
+            f"• AVG {word} {sign}{avg_delta:.1f} "
+            f"({older.avg_kills:.1f} → {recent.avg_kills:.1f})"
         )
 
     if recent.hs_pct > 0 and older.hs_pct > 0:
         hs_delta = recent.hs_pct - older.hs_pct
-        if hs_delta >= 3:
-            improved.append(
-                (
-                    hs_delta,
-                    f"✅ HS% вырос на {hs_delta:.0f}%",
-                )
+        if abs(hs_delta) > FORM_PCT_THRESHOLD:
+            word = "вырос" if hs_delta > 0 else "упал"
+            sign = "+" if hs_delta > 0 else ""
+            lines.append(
+                f"• HS% {word} {sign}{hs_delta:.0f}% "
+                f"({older.hs_pct:.0f}% → {recent.hs_pct:.0f}%)"
             )
-        elif hs_delta <= -3:
-            declined.append(
-                (
-                    -hs_delta,
-                    f"⚠️ HS% упал: было {older.hs_pct:.0f}% → "
-                    f"стало {recent.hs_pct:.0f}%",
-                )
-            )
-
-    kd_delta = recent.kd - older.kd
-    if kd_delta >= 0.08:
-        improved.append(
-            (
-                kd_delta,
-                f"✅ K/D вырос на {kd_delta:.2f} "
-                f"({older.kd:.2f} → {recent.kd:.2f})",
-            )
-        )
-    elif kd_delta <= -0.08:
-        declined.append(
-            (
-                -kd_delta,
-                f"⚠️ K/D упал: было {older.kd:.2f} → стало {recent.kd:.2f}",
-            )
-        )
 
     if (
         recent.clutch_1vx_win_rate is not None
@@ -2550,151 +2753,87 @@ def build_progress_changes(
     ):
         old_pct = older.clutch_1vx_win_rate * 100
         new_pct = recent.clutch_1vx_win_rate * 100
-        if new_pct - old_pct >= 8:
-            improved.append(
-                (
-                    new_pct - old_pct,
-                    f"✅ clutch winrate в 1vX вырос на {new_pct - old_pct:.0f}%",
-                )
-            )
-        elif old_pct - new_pct >= 8:
-            declined.append(
-                (
-                    old_pct - new_pct,
-                    f"⚠️ clutch winrate в 1vX упал с "
-                    f"{old_pct:.0f}% → {new_pct:.0f}%",
-                )
+        clutch_delta = new_pct - old_pct
+        if abs(clutch_delta) > FORM_PCT_THRESHOLD:
+            word = "вырос" if clutch_delta > 0 else "упал"
+            sign = "+" if clutch_delta > 0 else ""
+            lines.append(
+                f"• clutch winrate в 1vX {word} {sign}{clutch_delta:.0f}% "
+                f"({old_pct:.0f}% → {new_pct:.0f}%)"
             )
 
     if recent.entry_win_rate is not None and older.entry_win_rate is not None:
         old_pct = older.entry_win_rate * 100
         new_pct = recent.entry_win_rate * 100
-        if new_pct - old_pct >= 8:
-            improved.append(
-                (
-                    new_pct - old_pct,
-                    f"✅ entry winrate вырос на {new_pct - old_pct:.0f}%",
-                )
-            )
-        elif old_pct - new_pct >= 8:
-            declined.append(
-                (
-                    old_pct - new_pct,
-                    f"⚠️ entry winrate упал: было {old_pct:.0f}% → "
-                    f"стало {new_pct:.0f}%",
-                )
+        entry_delta = new_pct - old_pct
+        if abs(entry_delta) > FORM_PCT_THRESHOLD:
+            word = "вырос" if entry_delta > 0 else "упал"
+            sign = "+" if entry_delta > 0 else ""
+            lines.append(
+                f"• entry winrate {word} {sign}{entry_delta:.0f}% "
+                f"({old_pct:.0f}% → {new_pct:.0f}%)"
             )
 
-    fk_delta = recent.first_kills_avg - older.first_kills_avg
-    if fk_delta >= 0.3:
-        improved.append(
-            (
-                fk_delta,
-                f"✅ opening kills: +{fk_delta:.1f} за матч",
-            )
-        )
-    elif fk_delta <= -0.3:
-        declined.append(
-            (
-                -fk_delta,
-                f"⚠️ opening kills упали: было {older.first_kills_avg:.1f} → "
-                f"стало {recent.first_kills_avg:.1f}",
-            )
-        )
-
-    improved.sort(key=lambda item: item[0], reverse=True)
-    declined.sort(key=lambda item: item[0], reverse=True)
-    return (
-        [line for _, line in improved[:2]],
-        [line for _, line in declined[:2]],
-    )
+    return lines
 
 
-GROWTH_ZONE_MIN_SEVERITY = 4.0
-
-
-def find_growth_zones(older: PeriodStats, recent: PeriodStats) -> list[str]:
-    """1–2 зоны роста по самым сильным просадкам между периодами."""
-    issues: list[tuple[float, str]] = []
+def build_serious_declines(older: PeriodStats, recent: PeriodStats) -> list[str]:
+    """Серьёзные просадки (>15% по метрике) — отдельный блок."""
+    lines: list[str] = []
 
     if recent.hs_pct > 0 and older.hs_pct > 0:
-        hs_drop = older.hs_pct - recent.hs_pct
-        if hs_drop >= 3:
-            issues.append(
-                (
-                    hs_drop * 1.2,
-                    f"Аим: HS% упал с {older.hs_pct:.0f}% → {recent.hs_pct:.0f}%",
-                )
+        drop = older.hs_pct - recent.hs_pct
+        if drop > SERIOUS_DECLINE_PCT:
+            lines.append(
+                f"⚠️ HS% упал на {drop:.0f}% "
+                f"({older.hs_pct:.0f}% → {recent.hs_pct:.0f}%)"
             )
 
-    opening_death_rise = (
-        (recent.opening_death_rate - older.opening_death_rate) * 100
-    )
-    if opening_death_rise >= 3:
-        issues.append(
-            (
-                opening_death_rise * 1.1,
-                "Позиционная игра: чаще умираешь в первые секунды раунда за CT",
+    if older.kd > 0:
+        kd_drop_pct = (older.kd - recent.kd) / older.kd * 100
+        if kd_drop_pct > SERIOUS_DECLINE_PCT:
+            lines.append(
+                f"⚠️ K/D упал на {kd_drop_pct:.0f}% "
+                f"({older.kd:.2f} → {recent.kd:.2f})"
             )
-        )
+
+    if older.avg_kills > 0:
+        avg_drop_pct = (older.avg_kills - recent.avg_kills) / older.avg_kills * 100
+        if avg_drop_pct > SERIOUS_DECLINE_PCT:
+            lines.append(
+                f"⚠️ AVG упал на {avg_drop_pct:.0f}% "
+                f"({older.avg_kills:.1f} → {recent.avg_kills:.1f})"
+            )
 
     if (
         recent.clutch_1vx_win_rate is not None
         and older.clutch_1vx_win_rate is not None
+        and older.clutch_1vx_win_rate > 0
     ):
-        clutch_drop = (older.clutch_1vx_win_rate - recent.clutch_1vx_win_rate) * 100
-        if clutch_drop >= 6:
+        drop = (older.clutch_1vx_win_rate - recent.clutch_1vx_win_rate) * 100
+        if drop > SERIOUS_DECLINE_PCT:
             old_pct = older.clutch_1vx_win_rate * 100
             new_pct = recent.clutch_1vx_win_rate * 100
-            issues.append(
-                (
-                    clutch_drop * 1.15,
-                    f"Клатчи: clutch winrate в 1vX упал с "
-                    f"{old_pct:.0f}% → {new_pct:.0f}%",
-                )
+            lines.append(
+                f"⚠️ clutch winrate в 1vX упал на {drop:.0f}% "
+                f"({old_pct:.0f}% → {new_pct:.0f}%)"
             )
 
     if (
         recent.entry_win_rate is not None
         and older.entry_win_rate is not None
+        and older.entry_win_rate > 0
     ):
-        entry_drop = (older.entry_win_rate - recent.entry_win_rate) * 100
-        if entry_drop >= 6:
+        drop = (older.entry_win_rate - recent.entry_win_rate) * 100
+        if drop > SERIOUS_DECLINE_PCT:
             old_pct = older.entry_win_rate * 100
             new_pct = recent.entry_win_rate * 100
-            issues.append(
-                (
-                    entry_drop * 1.1,
-                    f"Entry: entry winrate упал с {old_pct:.0f}% → {new_pct:.0f}%",
-                )
+            lines.append(
+                f"⚠️ entry winrate упал на {drop:.0f}% "
+                f"({old_pct:.0f}% → {new_pct:.0f}%)"
             )
 
-    avg_drop = older.avg_kills - recent.avg_kills
-    if avg_drop >= 0.8:
-        issues.append(
-            (
-                avg_drop * 2.0,
-                f"Размены: AVG упал с {older.avg_kills:.1f} → {recent.avg_kills:.1f}",
-            )
-        )
-
-    kd_drop = older.kd - recent.kd
-    if kd_drop >= 0.1:
-        issues.append(
-            (
-                kd_drop * 15.0,
-                f"K/D: упал с {older.kd:.2f} → {recent.kd:.2f}",
-            )
-        )
-
-    if not issues:
-        return ["Явных зон роста нет, продолжай в том же духе"]
-
-    issues.sort(key=lambda item: item[0], reverse=True)
-    top = [message for severity, message in issues if severity >= GROWTH_ZONE_MIN_SEVERITY][:2]
-    if top:
-        return top
-    return ["Явных зон роста нет, продолжай в том же духе"]
+    return lines
 
 
 def collect_player_game_stat_items(
@@ -2781,10 +2920,14 @@ def build_user_progress(
 
     skill_level = resolve_skill_level(player, current_elo)
     benchmarks = get_level_benchmarks(cs2_stats, skill_level)
-    improved, declined = build_progress_changes(older, recent)
+    growth_context = build_growth_context(
+        recent_items, recent, cs2_stats, benchmarks
+    )
+    form_lines = build_form_progress(older, recent)
+    serious_declines = build_serious_declines(older, recent)
     form_score = compute_form_score(recent, benchmarks)
     style = compute_player_playstyle(recent_items, recent)
-    growth_zones = find_growth_zones(older, recent)
+    growth_zones = find_growth_zones(growth_context)
 
     return ProgressReport(
         style=style,
@@ -2793,8 +2936,8 @@ def build_user_progress(
         recent=recent,
         current_elo=current_elo,
         elo_delta=elo_delta,
-        improved=improved,
-        declined=declined,
+        form_lines=form_lines,
+        serious_declines=serious_declines,
         growth_zones=growth_zones,
         requested_count=requested_matches,
         match_count=available,
@@ -2813,7 +2956,7 @@ def format_progress_report(report: ProgressReport) -> str:
             "",
             "📈 ТВОЙ ПРОГРЕСС",
             "",
-            f"🏅 Стиль: {report.style} | Форма: {report.form_score:.1f}/10",
+            f"🏅 Стиль: {report.style} | RANK (форма): {report.form_score:.1f}/10",
             "",
             f"📊 Последние {report.match_count} матчей:",
             (
@@ -2834,24 +2977,20 @@ def format_progress_report(report: ProgressReport) -> str:
     elif report.current_elo is not None:
         lines.append(f"ELO ➡️ {report.current_elo} (текущий)")
 
-    lines.extend(["", "🔥 Прогресс:"])
-    if report.improved:
-        lines.extend(report.improved)
+    lines.extend(["", "🔥 Прогресс (FORM — ты vs ты):"])
+    if report.form_lines:
+        lines.extend(report.form_lines)
     else:
-        lines.append("✅ Заметного прогресса не найдено")
+        lines.append("• Без значимых изменений")
 
-    lines.append("")
-    if report.declined:
-        lines.extend(report.declined)
-    else:
-        lines.append("⚠️ Просадок не найдено")
+    if report.serious_declines:
+        lines.extend(["", "⚠️ Просадка:"])
+        lines.extend(report.serious_declines)
 
-    lines.extend(["", "🎯 ЗОНА РОСТА:"])
-    if report.growth_zones:
-        for zone in report.growth_zones:
-            lines.append(f"• {zone}")
-    else:
-        lines.append("• Явных зон роста нет, продолжай в том же духе")
+    lines.extend(["", "🎯 ЗОНА РОСТА (причины слабости):"])
+    for zone in report.growth_zones:
+        prefix = "" if zone.startswith("•") else "• "
+        lines.append(f"{prefix}{zone}")
 
     return "\n".join(lines)
 
