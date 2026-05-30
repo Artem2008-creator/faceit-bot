@@ -5,6 +5,7 @@ Telegram-бот: анализ слабого игрока в матче Faceit C
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import re
 import threading
@@ -336,7 +337,6 @@ STAT_CT_ROUNDS_WON_KEYS = ("CT Rounds Won", "CT Rounds won")
 FORM_KD_THRESHOLD = 0.05
 FORM_AVG_THRESHOLD = 2.0
 FORM_PCT_THRESHOLD = 3.0
-SERIOUS_DECLINE_PCT = 15.0
 GROWTH_NO_ISSUES_MSG = "Явных зон роста нет, продолжай в том же духе"
 STAT_MAP_MATCHES_KEYS = ("Total Matches", "Matches", "Total matches")
 STAT_PLANTS_KEYS = ("Bomb Plants", "Plants")
@@ -541,12 +541,16 @@ class FaceitService:
             )
         return self._match_stats_cache[match_id]
 
-    def get_player_cs2_stats(self, player_id: str) -> dict[str, Any]:
-        if player_id not in self._player_cs2_stats_cache:
+    def get_player_cs2_stats(self, player_id: str, *, refresh: bool = False) -> dict[str, Any]:
+        if refresh or player_id not in self._player_cs2_stats_cache:
             self._player_cs2_stats_cache[player_id] = self._request(
                 "GET", f"/players/{player_id}/stats/cs2"
             )
-        return self._player_cs2_stats_cache[player_id]
+        return copy.deepcopy(self._player_cs2_stats_cache[player_id])
+
+    def clear_player_progress_cache(self, player_id: str) -> None:
+        """Сброс кэша игрока перед новым /progress (без данных других ников)."""
+        self._player_cs2_stats_cache.pop(player_id, None)
 
     def get_player_game_stats(
         self, player_id: str, *, offset: int = 0, limit: int = GAME_STATS_FETCH_LIMIT
@@ -987,7 +991,7 @@ def _resolve_nuke_rotation_main(
 def extract_heatmap_scores(stats: dict[str, Any], map_key: str) -> dict[str, float]:
     """Зоны из heatmap/position полей Faceit API (сегменты и матч-статы)."""
     if map_key not in MAP_VALID_POSITIONS or not stats:
-        return {}
+    return {}
 
     scores: dict[str, float] = {}
     aliases = POSITION_ALIASES.get(map_key, {})
@@ -1077,7 +1081,7 @@ def _pick_role_candidates_with_heatmap(
         if not filtered:
             continue
         return max(filtered, key=filtered.get)
-    return None
+        return None
 
 
 def collect_faceit_heatmap_scores(
@@ -1331,8 +1335,8 @@ def build_map_recommendations(
             if not user_sufficient:
                 candidates.append(
                     MapRecommendation(
-                        map_key=map_key,
-                        display_name=format_map_name(map_key),
+            map_key=map_key,
+            display_name=format_map_name(map_key),
                         action="decider",
                         opponent_win_rate=opponent_win_rate,
                         user_win_rate=None,
@@ -2154,13 +2158,13 @@ class GrowthContext:
 @dataclass
 class ProgressReport:
     style: str
-    form_score: float
+    performance_rank: int
     older: PeriodStats
     recent: PeriodStats
     current_elo: int | None
     elo_delta: int | None
     form_lines: list[str]
-    serious_declines: list[str]
+    trend_summary: str
     growth_zones: list[str]
     requested_count: int
     match_count: int
@@ -2329,14 +2333,19 @@ def _playstyle_metrics_from_items(
 def _playstyle_proximity_scores(metrics: PlaystyleMetrics) -> dict[str, float]:
     """Насколько статистика близка к порогам каждой роли (1.0 = порог достигнут)."""
     lurker_score = 0.0
-    if metrics.opening_kills_avg < 1.2:
-        lurker_score += (1.2 - metrics.opening_kills_avg) / 1.2
-    if metrics.awp_kill_share < 0.15:
-        lurker_score += (0.15 - metrics.awp_kill_share) / 0.15
-    lurker_score = min(1.0, lurker_score / 2.0)
+    if metrics.opening_kills_avg < 0.9 and metrics.awp_kill_share < 0.10:
+        lurker_score = min(
+            1.0,
+            (0.9 - metrics.opening_kills_avg) / 0.9 * 0.5
+            + (0.10 - metrics.awp_kill_share) / 0.10 * 0.5,
+        )
 
     carry_kd = min(1.0, metrics.kd / 1.2) if metrics.kd > 0 else 0.0
     carry_avg = min(1.0, metrics.avg_kills / 20.0) if metrics.avg_kills > 0 else 0.0
+    rifler_score = min(
+        1.0,
+        metrics.kd / 1.0 * 0.5 + metrics.avg_kills / 16.0 * 0.5,
+    )
 
     return {
         "Entry Fragger": (
@@ -2351,17 +2360,37 @@ def _playstyle_proximity_scores(metrics: PlaystyleMetrics) -> dict[str, float]:
         ),
         "Carry": (carry_kd + carry_avg) / 2.0,
         "Lurker": lurker_score,
-        "Rifler": 0.35,
+        "Rifler": rifler_score,
     }
 
 
 def compute_player_playstyle(
-    items: list[dict[str, Any]], recent: PeriodStats
+    items: list[dict[str, Any]],
+    recent: PeriodStats,
+    *,
+    nickname: str = "",
+    player_id: str = "",
 ) -> str:
-    """Стиль только по статистике последних матчей."""
+    """Стиль только по статистике последних матчей (локальные данные игрока)."""
     metrics = _playstyle_metrics_from_items(items, recent)
+    logger.info(
+        "Progress playstyle nick=%s player_id=%s opening_kills=%.2f awp_share=%.0f%% "
+        "clutch_wr=%.0f%% flash_assists=%.2f kd=%.2f avg=%.1f matches=%d",
+        nickname,
+        player_id,
+        metrics.opening_kills_avg,
+        metrics.awp_kill_share * 100,
+        metrics.clutch_win_rate * 100,
+        metrics.flash_assists_avg,
+        metrics.kd,
+        metrics.avg_kills,
+        metrics.match_count,
+    )
+
     if metrics.match_count == 0 and metrics.kd <= 0:
-        return "Rifler"
+        style = "Rifler"
+        logger.info("Progress playstyle result=%s (no match data)", style)
+        return style
 
     qualified: list[tuple[float, str]] = []
     if metrics.opening_kills_avg > 1.2:
@@ -2383,10 +2412,14 @@ def compute_player_playstyle(
         )
 
     if qualified:
-        return max(qualified, key=lambda item: item[1])[0]
+        style = max(qualified, key=lambda item: item[1])[0]
+        logger.info("Progress playstyle result=%s (threshold match)", style)
+        return style
 
     proximity = _playstyle_proximity_scores(metrics)
-    return max(proximity, key=proximity.get)
+    style = max(proximity, key=proximity.get)
+    logger.info("Progress playstyle result=%s proximity=%s", style, proximity)
+    return style
 
 
 def resolve_skill_level(player: dict[str, Any], current_elo: int | None) -> int:
@@ -2505,6 +2538,12 @@ def compute_form_score(
     return max(1.0, min(10.0, score))
 
 
+def compute_performance_rank(recent: PeriodStats, benchmarks: dict[str, float]) -> int:
+    """RANK: 0–100 vs игроки того же ELO (из оценки формы 1–10)."""
+    score_10 = compute_form_score(recent, benchmarks)
+    return max(0, min(100, round(score_10 * 10)))
+
+
 def _kd_volatility_from_items(items: list[dict[str, Any]]) -> float:
     kd_values: list[float] = []
     for item in items:
@@ -2604,8 +2643,8 @@ def find_growth_zones(context: GrowthContext) -> list[str]:
         candidates.append((priority, severity, category, detail))
 
     entry_wr = recent.entry_win_rate
-    opening_high = recent.opening_death_rate >= 0.17
-    dies_often = opening_high or (recent.kd < 1.0 and recent.opening_death_rate >= 0.12)
+    opening_high = recent.opening_death_rate >= 0.20
+    dies_often = opening_high or (recent.kd < 0.95 and recent.opening_death_rate >= 0.14)
 
     if entry_wr is not None and entry_wr < 0.45:
         add(1, 0.45 - entry_wr, "entry", "Первый контакт (низкий entry winrate)")
@@ -2651,9 +2690,10 @@ def find_growth_zones(context: GrowthContext) -> list[str]:
     hold_low = context.hold_rating is not None and context.hold_rating < 0.55
     ct_low = context.ct_win_rate is not None and context.ct_win_rate < 45
     anchor_losing = (
-        recent.win_rate < 45
-        and recent.opening_death_rate < 0.14
-        and recent.kd >= 0.85
+        recent.win_rate < 40
+        and recent.opening_death_rate < 0.12
+        and recent.kd >= 0.90
+        and recent.played >= 4
     )
 
     if hold_low:
@@ -2777,63 +2817,59 @@ def build_form_progress(older: PeriodStats, recent: PeriodStats) -> list[str]:
     return lines
 
 
-def build_serious_declines(older: PeriodStats, recent: PeriodStats) -> list[str]:
-    """Серьёзные просадки (>15% по метрике) — отдельный блок."""
-    lines: list[str] = []
+def _form_metric_change_percents(
+    older: PeriodStats, recent: PeriodStats
+) -> list[float]:
+    """Относительное изменение метрик для тренда (%); + лучше, − хуже."""
+    changes: list[float] = []
+
+    if older.kd > 0 and abs(recent.kd - older.kd) > FORM_KD_THRESHOLD:
+        changes.append((recent.kd - older.kd) / older.kd * 100)
+
+    if older.avg_kills > 0 and abs(recent.avg_kills - older.avg_kills) > FORM_AVG_THRESHOLD:
+        changes.append((recent.avg_kills - older.avg_kills) / older.avg_kills * 100)
 
     if recent.hs_pct > 0 and older.hs_pct > 0:
-        drop = older.hs_pct - recent.hs_pct
-        if drop > SERIOUS_DECLINE_PCT:
-            lines.append(
-                f"⚠️ HS% упал на {drop:.0f}% "
-                f"({older.hs_pct:.0f}% → {recent.hs_pct:.0f}%)"
-            )
-
-    if older.kd > 0:
-        kd_drop_pct = (older.kd - recent.kd) / older.kd * 100
-        if kd_drop_pct > SERIOUS_DECLINE_PCT:
-            lines.append(
-                f"⚠️ K/D упал на {kd_drop_pct:.0f}% "
-                f"({older.kd:.2f} → {recent.kd:.2f})"
-            )
-
-    if older.avg_kills > 0:
-        avg_drop_pct = (older.avg_kills - recent.avg_kills) / older.avg_kills * 100
-        if avg_drop_pct > SERIOUS_DECLINE_PCT:
-            lines.append(
-                f"⚠️ AVG упал на {avg_drop_pct:.0f}% "
-                f"({older.avg_kills:.1f} → {recent.avg_kills:.1f})"
-            )
+        hs_delta = recent.hs_pct - older.hs_pct
+        if abs(hs_delta) > FORM_PCT_THRESHOLD:
+            changes.append(hs_delta)
 
     if (
         recent.clutch_1vx_win_rate is not None
         and older.clutch_1vx_win_rate is not None
         and older.clutch_1vx_win_rate > 0
     ):
-        drop = (older.clutch_1vx_win_rate - recent.clutch_1vx_win_rate) * 100
-        if drop > SERIOUS_DECLINE_PCT:
-            old_pct = older.clutch_1vx_win_rate * 100
-            new_pct = recent.clutch_1vx_win_rate * 100
-            lines.append(
-                f"⚠️ clutch winrate в 1vX упал на {drop:.0f}% "
-                f"({old_pct:.0f}% → {new_pct:.0f}%)"
-            )
+        delta = (recent.clutch_1vx_win_rate - older.clutch_1vx_win_rate) * 100
+        if abs(delta) > FORM_PCT_THRESHOLD:
+            changes.append(delta)
 
     if (
         recent.entry_win_rate is not None
         and older.entry_win_rate is not None
         and older.entry_win_rate > 0
     ):
-        drop = (older.entry_win_rate - recent.entry_win_rate) * 100
-        if drop > SERIOUS_DECLINE_PCT:
-            old_pct = older.entry_win_rate * 100
-            new_pct = recent.entry_win_rate * 100
-            lines.append(
-                f"⚠️ entry winrate упал на {drop:.0f}% "
-                f"({old_pct:.0f}% → {new_pct:.0f}%)"
-            )
+        delta = (recent.entry_win_rate - older.entry_win_rate) * 100
+        if abs(delta) > FORM_PCT_THRESHOLD:
+            changes.append(delta)
 
-    return lines
+    return changes
+
+
+def build_trend_summary(older: PeriodStats, recent: PeriodStats) -> str:
+    """Краткий вывод по динамике (FORM), без дублирования списка метрик."""
+    changes = _form_metric_change_percents(older, recent)
+    if not changes:
+        return "Плато, без значимых изменений"
+
+    improved = sum(1 for value in changes if value > 0)
+    declined = sum(1 for value in changes if value < 0)
+    avg_change = sum(changes) / len(changes)
+
+    if improved > declined:
+        return f"Уверенный прогресс ({avg_change:+.0f}%)"
+    if declined > improved:
+        return f"Общая форма снижается ({avg_change:.0f}%)"
+    return "Разнонаправленная динамика, стабильность"
 
 
 def collect_player_game_stat_items(
@@ -2856,7 +2892,7 @@ def collect_player_game_stat_items(
         if len(batch) < page_limit:
             break
 
-    return collected[:limit]
+    return [copy.deepcopy(item) for item in collected[:limit]]
 
 
 def progress_keyboard() -> InlineKeyboardMarkup:
@@ -2873,15 +2909,24 @@ def progress_keyboard() -> InlineKeyboardMarkup:
 def build_user_progress(
     service: FaceitService, nickname: str, requested_matches: int
 ) -> ProgressReport:
+    logger.info("Progress start nick=%s matches=%d", nickname, requested_matches)
+
     player = service.lookup_player_by_nickname(nickname)
     player_id = player.get("player_id")
     if not player_id:
         raise ValueError(f"Игрок «{nickname}» не найден на Faceit.")
 
-    cs2_stats = service.get_player_cs2_stats(player_id)
+    service.clear_player_progress_cache(player_id)
+    cs2_stats = service.get_player_cs2_stats(player_id, refresh=True)
     service.get_player_history(player_id, limit=requested_matches)
 
     items = collect_player_game_stat_items(service, player_id, requested_matches)
+    logger.info(
+        "Progress data nick=%s player_id=%s items=%d",
+        nickname,
+        player_id,
+        len(items),
+    )
     available = len(items)
 
     if available < PROGRESS_MIN_MATCHES:
@@ -2924,20 +2969,28 @@ def build_user_progress(
         recent_items, recent, cs2_stats, benchmarks
     )
     form_lines = build_form_progress(older, recent)
-    serious_declines = build_serious_declines(older, recent)
-    form_score = compute_form_score(recent, benchmarks)
-    style = compute_player_playstyle(recent_items, recent)
+    trend_summary = build_trend_summary(older, recent)
+    performance_rank = compute_performance_rank(recent, benchmarks)
+    style = compute_player_playstyle(
+        recent_items, recent, nickname=nickname, player_id=player_id
+    )
     growth_zones = find_growth_zones(growth_context)
+    logger.info(
+        "Progress zones nick=%s player_id=%s zones=%s",
+        nickname,
+        player_id,
+        growth_zones,
+    )
 
     return ProgressReport(
         style=style,
-        form_score=form_score,
+        performance_rank=performance_rank,
         older=older,
         recent=recent,
         current_elo=current_elo,
         elo_delta=elo_delta,
         form_lines=form_lines,
-        serious_declines=serious_declines,
+        trend_summary=trend_summary,
         growth_zones=growth_zones,
         requested_count=requested_matches,
         match_count=available,
@@ -2951,12 +3004,14 @@ def format_progress_report(report: ProgressReport) -> str:
     ]
     if report.partial_note:
         lines.append(report.partial_note)
+
     lines.extend(
         [
             "",
             "📈 ТВОЙ ПРОГРЕСС",
             "",
-            f"🏅 Стиль: {report.style} | RANK (форма): {report.form_score:.1f}/10",
+            f"🏅 Стиль: {report.style}",
+            f"📊 Performance rank: {report.performance_rank}/100 (vs same ELO)",
             "",
             f"📊 Последние {report.match_count} матчей:",
             (
@@ -2977,17 +3032,15 @@ def format_progress_report(report: ProgressReport) -> str:
     elif report.current_elo is not None:
         lines.append(f"ELO ➡️ {report.current_elo} (текущий)")
 
-    lines.extend(["", "🔥 Прогресс (FORM — ты vs ты):"])
+    lines.extend(["", "📈 ДИНАМИКА (ты vs ты):"])
     if report.form_lines:
         lines.extend(report.form_lines)
     else:
         lines.append("• Без значимых изменений")
 
-    if report.serious_declines:
-        lines.extend(["", "⚠️ Просадка:"])
-        lines.extend(report.serious_declines)
+    lines.extend(["", "📉 ТРЕНД:", report.trend_summary])
 
-    lines.extend(["", "🎯 ЗОНА РОСТА (причины слабости):"])
+    lines.extend(["", "🎯 ЗОНА РОСТА:"])
     for zone in report.growth_zones:
         prefix = "" if zone.startswith("•") else "• "
         lines.append(f"{prefix}{zone}")
@@ -3114,7 +3167,7 @@ async def progress_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.exception("Неожиданная ошибка при расчёте прогресса")
         await query.edit_message_text(
             "❌ Произошла непредвиденная ошибка. Попробуйте позже."
-        )
+    )
 
 
 async def handle_match_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
