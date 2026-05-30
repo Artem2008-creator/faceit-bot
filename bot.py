@@ -14,7 +14,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+from typing import Any, Literal
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -2166,6 +2166,7 @@ class ProgressReport:
     elo_delta: int | None
     form_lines: list[str]
     trend_summary: str
+    overall_form: str
     growth_zones: list[str]
     requested_count: int
     match_count: int
@@ -2691,19 +2692,63 @@ def _form_metric_change_percents(
     return changes
 
 
-def build_trend_summary(older: PeriodStats, recent: PeriodStats) -> str:
-    """Краткий вывод по динамике (FORM), без дублирования списка метрик."""
+TrendDirection = Literal["positive", "negative", "plateau"]
+
+
+def classify_trend_direction(
+    older: PeriodStats, recent: PeriodStats
+) -> TrendDirection:
+    """Направление динамики: рост, спад или плато."""
     changes = _form_metric_change_percents(older, recent)
     if not changes:
-        return "Плато, без значимых изменений"
+        return "plateau"
 
     improved = sum(1 for value in changes if value > 0)
     declined = sum(1 for value in changes if value < 0)
-    avg_change = sum(changes) / len(changes)
-
     if improved > declined:
-        return f"Уверенный прогресс ({avg_change:+.0f}%)"
+        return "positive"
     if declined > improved:
+        return "negative"
+    return "plateau"
+
+
+def compute_overall_form(performance_rank: int, trend: TrendDirection) -> str:
+    """Итоговая форма: абсолютный rank + направление тренда."""
+    if trend == "plateau":
+        if performance_rank > 80:
+            base = "✅ Высокий уровень"
+        elif performance_rank >= 50:
+            base = "➡️ Стабильная форма"
+        else:
+            base = "⚖️ Низкий уровень"
+        return f"{base} · Стабильно"
+
+    if performance_rank > 80:
+        if trend == "positive":
+            return "🔥 Пик формы (доминируешь)"
+        return "⚠️ Спад, но уровень высокий"
+
+    if performance_rank >= 50:
+        if trend == "positive":
+            return "📈 На подъёме"
+        return "📉 Требуется восстановление"
+
+    if trend == "positive":
+        return "🔄 Выход из ямы"
+    return "🔻 Сложный период"
+
+
+def build_trend_summary(older: PeriodStats, recent: PeriodStats) -> str:
+    """Краткий вывод по динамике (FORM), без дублирования списка метрик."""
+    changes = _form_metric_change_percents(older, recent)
+    direction = classify_trend_direction(older, recent)
+    if direction == "plateau" and not changes:
+        return "Плато, без значимых изменений"
+
+    avg_change = sum(changes) / len(changes)
+    if direction == "positive":
+        return f"Уверенный прогресс ({avg_change:+.0f}%)"
+    if direction == "negative":
         return f"Общая форма снижается ({avg_change:.0f}%)"
     return "Разнонаправленная динамика, стабильность"
 
@@ -2808,7 +2853,9 @@ def build_user_progress(
     )
     form_lines = build_form_progress(older, recent)
     trend_summary = build_trend_summary(older, recent)
+    trend_direction = classify_trend_direction(older, recent)
     performance_rank = compute_performance_rank(recent)
+    overall_form = compute_overall_form(performance_rank, trend_direction)
     style = compute_player_playstyle(
         recent_items, recent, nickname=nickname, player_id=player_id
     )
@@ -2823,6 +2870,7 @@ def build_user_progress(
         elo_delta=elo_delta,
         form_lines=form_lines,
         trend_summary=trend_summary,
+        overall_form=overall_form,
         growth_zones=growth_zones,
         requested_count=requested_matches,
         match_count=available,
@@ -2870,7 +2918,8 @@ def format_progress_report(report: ProgressReport) -> str:
     else:
         lines.append("• Без значимых изменений")
 
-    lines.extend(["", "📉 ТРЕНД:", report.trend_summary])
+    lines.extend(["", f"📉 ТРЕНД: {report.trend_summary}"])
+    lines.append(f"🎯 ИТОГОВАЯ ФОРМА: {report.overall_form}")
 
     lines.extend(["", "🎯 ЗОНА РОСТА:"])
     for zone in report.growth_zones:
