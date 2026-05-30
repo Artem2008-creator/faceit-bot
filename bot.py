@@ -358,13 +358,36 @@ STAT_AVG_ASSISTS_KEYS = ("Average Assists", "Avg Assists")
 STAT_ENEMIES_FLASHED_PER_ROUND_KEYS = ("Enemies Flashed per Round",)
 STAT_SNIPER_KILL_RATE_KEYS = ("Sniper Kill Rate per Round", "Sniper Kill Rate")
 STAT_LIFETIME_FIRST_KILLS_KEYS = ("First Kills", "Total First Kills")
+STAT_AWP_KILL_PCT_KEYS = (
+    "AWP Kill Rate",
+    "AWP Kills %",
+    "Sniper Kill Rate per Round",
+    "Sniper Kill Rate",
+)
+STAT_OPENING_DUELS_SHARE_KEYS = (
+    "Opening Duels %",
+    "Opening Duels Share",
+    "Opening Duel Win Rate",
+)
 
-PLAYSTYLE_OPENING_KILLS_BENCHMARK = 0.5
-PLAYSTYLE_ENTRY_RATE_BENCHMARK = 0.15
+PLAYSTYLE_OPENING_KILLS_RATE_AVG = 0.12
+PLAYSTYLE_ENTRY_OPENING_MIN = 0.15
+PLAYSTYLE_ENTRY_ATTEMPT_MIN = 0.35
+PLAYSTYLE_OPENING_DUELS_MIN = 0.30
+PLAYSTYLE_AWP_KILL_MIN = 0.30
+PLAYSTYLE_CARRY_MIN_SCORE = 0.6
+PLAYSTYLE_RIFLER_BASE_SCORE = 0.5
 PLAYSTYLE_FLASH_ASSISTS_BENCHMARK = 0.15
 PLAYSTYLE_ASSISTS_BENCHMARK = 5.0
-PLAYSTYLE_ENTRY_MIN_SCORE = 0.6
-PLAYSTYLE_CARRY_MIN_SCORE = 0.6
+
+ROLE_LABELS: dict[str, str] = {
+    "entry": "Entry Fragger",
+    "awper": "AWPer",
+    "support": "Support",
+    "lurker": "Lurker",
+    "rifler": "Rifler",
+    "carry": "Carry",
+}
 
 # Человекочитаемые названия зон для паттернов CT/T
 MAP_ZONE_LABELS: dict[str, dict[str, str]] = {
@@ -2177,7 +2200,8 @@ class GrowthContext:
 
 @dataclass
 class ProgressReport:
-    style: str
+    player_role: str
+    player_style: str
     performance_rank: int
     older: PeriodStats
     recent: PeriodStats
@@ -2293,14 +2317,20 @@ def _period_stats_from_items(items: list[dict[str, Any]]) -> PeriodStats | None:
 
 @dataclass
 class PlaystyleApiInputs:
-    """Метрики стиля только из полей /players/{id}/stats/cs2 (lifetime)."""
-    opening_kills_per_round: float | None = None
-    entry_rate: float | None = None
+    """Метрики ROLE/STYLE только из /players/{id}/stats/cs2 (lifetime)."""
+    opening_kills_rate: float | None = None
+    entry_attempt_rate: float | None = None
+    opening_duels_share: float | None = None
+    awp_kill_share: float | None = None
     flash_assists_per_round: float | None = None
     assists_per_round: float | None = None
     kd: float | None = None
     avg_kills: float | None = None
     fields_used: tuple[str, ...] = ()
+
+
+def _as_ratio(value: float) -> float:
+    return value / 100.0 if value > 1.0 else value
 
 
 def _lifetime_playstyle_field(
@@ -2324,8 +2354,10 @@ def _extract_cs2_playstyle_inputs(cs2_stats: dict[str, Any]) -> PlaystyleApiInpu
         return PlaystyleApiInputs()
 
     fields_used: list[str] = []
-    opening_kills_per_round: float | None = None
-    entry_rate: float | None = None
+    opening_kills_rate: float | None = None
+    entry_attempt_rate: float | None = None
+    opening_duels_share: float | None = None
+    awp_kill_share: float | None = None
     flash_assists_per_round: float | None = None
     assists_per_round: float | None = None
 
@@ -2334,25 +2366,28 @@ def _extract_cs2_playstyle_inputs(cs2_stats: dict[str, Any]) -> PlaystyleApiInpu
         lifetime, STAT_LIFETIME_FIRST_KILLS_KEYS
     )
     if first_kills_total is not None and total_rounds and total_rounds > 0:
-        opening_kills_per_round = first_kills_total / total_rounds
+        opening_kills_rate = first_kills_total / total_rounds
         fields_used.append("First Kills/rounds")
 
     entry_raw = _lifetime_playstyle_field(lifetime, STAT_ENTRY_RATE_KEYS)
     if entry_raw is not None:
-        entry_rate = entry_raw / 100.0 if entry_raw > 1.0 else entry_raw
+        entry_attempt_rate = _as_ratio(entry_raw)
         fields_used.append("Entry Rate")
+
+    duels_raw = _lifetime_playstyle_field(lifetime, STAT_OPENING_DUELS_SHARE_KEYS)
+    if duels_raw is not None:
+        opening_duels_share = _as_ratio(duels_raw)
+        fields_used.append("Opening Duels")
+
+    awp_raw = _first_present(lifetime, STAT_AWP_KILL_PCT_KEYS)
+    if awp_raw is not None:
+        awp_kill_share = _as_ratio(_parse_float(awp_raw))
+        fields_used.append("AWP/Sniper kill %")
 
     flash_assists_total = _lifetime_playstyle_field(lifetime, STAT_FLASH_ASSISTS_KEYS)
     if flash_assists_total is not None and total_rounds and total_rounds > 0:
         flash_assists_per_round = flash_assists_total / total_rounds
         fields_used.append("Flash Assists/rounds")
-    else:
-        enemies_flashed = _lifetime_playstyle_field(
-            lifetime, STAT_ENEMIES_FLASHED_PER_ROUND_KEYS
-        )
-        if enemies_flashed is not None:
-            flash_assists_per_round = enemies_flashed
-            fields_used.append("Enemies Flashed per Round")
 
     avg_assists = _lifetime_playstyle_field(lifetime, STAT_AVG_ASSISTS_KEYS)
     if avg_assists is not None:
@@ -2368,8 +2403,10 @@ def _extract_cs2_playstyle_inputs(cs2_stats: dict[str, Any]) -> PlaystyleApiInpu
         fields_used.append("Average Kills")
 
     return PlaystyleApiInputs(
-        opening_kills_per_round=opening_kills_per_round,
-        entry_rate=entry_rate,
+        opening_kills_rate=opening_kills_rate,
+        entry_attempt_rate=entry_attempt_rate,
+        opening_duels_share=opening_duels_share,
+        awp_kill_share=awp_kill_share,
         flash_assists_per_round=flash_assists_per_round,
         assists_per_round=assists_per_round,
         kd=kd,
@@ -2378,179 +2415,128 @@ def _extract_cs2_playstyle_inputs(cs2_stats: dict[str, Any]) -> PlaystyleApiInpu
     )
 
 
-def _normalize_playstyle_score(value: float, benchmark: float) -> float:
-    """0.5 при среднем уровне; +50% к эталону → ~0.75."""
-    if benchmark <= 0:
-        return 0.5
-    ratio = value / benchmark
-    return max(0.0, min(1.0, 0.5 + (ratio - 1.0) * 0.5))
+def _entry_fragger_eligible(inputs: PlaystyleApiInputs) -> bool:
+    if (
+        inputs.opening_kills_rate is None
+        or inputs.opening_kills_rate <= PLAYSTYLE_ENTRY_OPENING_MIN
+    ):
+        return False
+    if inputs.entry_attempt_rate is not None:
+        if inputs.entry_attempt_rate <= PLAYSTYLE_ENTRY_ATTEMPT_MIN:
+            return False
+    if inputs.opening_duels_share is not None:
+        if inputs.opening_duels_share <= PLAYSTYLE_OPENING_DUELS_MIN:
+            return False
+    return True
 
 
-def _compute_playstyle_scores(inputs: PlaystyleApiInputs) -> dict[str, float | None]:
-    scores: dict[str, float | None] = {
-        "entry": None,
-        "lurker": None,
-        "support": None,
-        "awper": None,
-        "rifler": None,
-        "carry": None,
+def _opening_above_average(inputs: PlaystyleApiInputs) -> bool:
+    if inputs.opening_kills_rate is None:
+        return False
+    return inputs.opening_kills_rate > PLAYSTYLE_OPENING_KILLS_RATE_AVG
+
+
+def _compute_role_scores(inputs: PlaystyleApiInputs) -> dict[str, float]:
+    """Конкурирующие оценки ролей; побеждает максимум."""
+    scores: dict[str, float] = {
+        "entry": 0.0,
+        "awper": 0.0,
+        "support": 0.0,
+        "lurker": 0.0,
+        "rifler": PLAYSTYLE_RIFLER_BASE_SCORE,
+        "carry": 0.0,
     }
 
-    entry_value = inputs.opening_kills_per_round
-    entry_benchmark = PLAYSTYLE_OPENING_KILLS_BENCHMARK
-    if entry_value is None and inputs.entry_rate is not None:
-        entry_value = inputs.entry_rate
-        entry_benchmark = PLAYSTYLE_ENTRY_RATE_BENCHMARK
+    if _entry_fragger_eligible(inputs):
+        scores["entry"] = 0.95
 
-    if entry_value is not None:
-        entry_score = _normalize_playstyle_score(entry_value, entry_benchmark)
-        scores["entry"] = entry_score
-        lurker_score = 1.0 - entry_score
-        if entry_score < 0.4 and inputs.kd is not None and inputs.kd > 1.1:
-            lurker_score = min(1.0, lurker_score * 1.2)
-        scores["lurker"] = lurker_score
+    if inputs.awp_kill_share is not None and inputs.awp_kill_share > PLAYSTYLE_AWP_KILL_MIN:
+        scores["awper"] = min(0.85, 0.55 + inputs.awp_kill_share)
 
-    support_parts: list[tuple[float, float]] = []
-    if inputs.flash_assists_per_round is not None:
-        support_parts.append(
-            (
-                _normalize_playstyle_score(
-                    inputs.flash_assists_per_round,
-                    PLAYSTYLE_FLASH_ASSISTS_BENCHMARK,
-                ),
-                0.6,
-            )
-        )
-    if inputs.assists_per_round is not None:
-        support_parts.append(
-            (
-                _normalize_playstyle_score(
-                    inputs.assists_per_round,
-                    PLAYSTYLE_ASSISTS_BENCHMARK,
-                ),
-                0.4,
-            )
-        )
-    if support_parts:
-        total_weight = sum(weight for _, weight in support_parts)
-        scores["support"] = sum(
-            value * weight for value, weight in support_parts
-        ) / total_weight
+    support_score = 0.0
+    if (
+        inputs.flash_assists_per_round is not None
+        and inputs.flash_assists_per_round
+        >= PLAYSTYLE_FLASH_ASSISTS_BENCHMARK * 1.5
+    ):
+        support_score = max(support_score, 0.75)
+    if (
+        inputs.assists_per_round is not None
+        and inputs.assists_per_round >= PLAYSTYLE_ASSISTS_BENCHMARK * 1.5
+    ):
+        support_score = max(support_score, 0.72)
+    scores["support"] = support_score
 
-    awper_score = 0.0
-    if inputs.avg_kills is not None and inputs.kd is not None:
-        if inputs.avg_kills > 25 and inputs.kd > 1.5:
-            awper_score += 0.7
-        elif inputs.avg_kills > 20 and inputs.kd > 1.2:
-            awper_score += 0.4
-    if awper_score > 0:
-        scores["awper"] = min(0.8, awper_score)
+    if (
+        inputs.opening_kills_rate is not None
+        and inputs.kd is not None
+        and inputs.opening_kills_rate < PLAYSTYLE_OPENING_KILLS_RATE_AVG * 0.7
+        and inputs.kd > 1.1
+    ):
+        scores["lurker"] = 0.70
 
-    if inputs.kd is not None and inputs.avg_kills is not None:
-        carry_score = 0.4
-        if inputs.kd > 1.5 and inputs.avg_kills > 25:
-            carry_score += 0.6
-        elif inputs.kd > 1.3 and inputs.avg_kills > 22:
-            carry_score += 0.4
-        scores["carry"] = min(1.0, carry_score)
-
-    rifler_score = 0.35
-    specialty_scores = [
-        score
-        for role, score in scores.items()
-        if role not in ("rifler", "carry") and score is not None
-    ]
-    if specialty_scores and all(score < 0.5 for score in specialty_scores):
-        rifler_score = 0.6
     if (
         inputs.kd is not None
         and inputs.avg_kills is not None
-        and 0.9 <= inputs.kd <= 1.3
-        and 15 <= inputs.avg_kills <= 22
+        and not _opening_above_average(inputs)
     ):
-        rifler_score = min(1.0, rifler_score * 1.2)
-    scores["rifler"] = rifler_score
+        carry_score = 0.4
+        if inputs.kd > 1.5 and inputs.avg_kills > 25:
+            carry_score = 1.0
+        elif inputs.kd > 1.3 and inputs.avg_kills > 22:
+            carry_score = 0.8
+        if carry_score > PLAYSTYLE_CARRY_MIN_SCORE:
+            scores["carry"] = carry_score
 
     return scores
 
 
-PLAYSTYLE_ROLE_LABELS: dict[str, str] = {
-    "entry": "Entry Fragger",
-    "lurker": "Lurker",
-    "support": "Support",
-    "awper": "AWPer",
-    "rifler": "Rifler",
-    "carry": "Carry",
-}
+def _compute_aggression_style(inputs: PlaystyleApiInputs) -> str:
+    rate = inputs.opening_kills_rate
+    if rate is None:
+        return "Balanced"
+    if rate > PLAYSTYLE_OPENING_KILLS_RATE_AVG * 1.2:
+        return "Aggressive"
+    if rate < PLAYSTYLE_OPENING_KILLS_RATE_AVG * 0.8:
+        return "Passive"
+    return "Balanced"
 
 
-def _format_playstyle_score(score: float | None) -> str:
-    return f"{score:.2f}" if score is not None else "n/a"
+def _format_role_score(score: float) -> str:
+    return f"{score:.2f}"
 
 
-def _entry_opening_below_average(inputs: PlaystyleApiInputs) -> bool:
-    if inputs.opening_kills_per_round is not None:
-        return (
-            inputs.opening_kills_per_round < PLAYSTYLE_OPENING_KILLS_BENCHMARK
-        )
-    if inputs.entry_rate is not None:
-        return inputs.entry_rate < PLAYSTYLE_ENTRY_RATE_BENCHMARK
-    return True
-
-
-def _select_playstyle_from_scores(
-    scores: dict[str, float | None],
-    inputs: PlaystyleApiInputs,
-) -> str:
-    eligible: dict[str, float] = {}
-
-    for role, score in scores.items():
-        if score is None:
-            continue
-        if role == "entry":
-            if score <= PLAYSTYLE_ENTRY_MIN_SCORE:
-                continue
-            if _entry_opening_below_average(inputs):
-                continue
-        if role == "carry" and score <= PLAYSTYLE_CARRY_MIN_SCORE:
-            continue
-        eligible[role] = score
-
-    if not eligible:
-        return PLAYSTYLE_ROLE_LABELS["rifler"]
-
-    top_role = max(eligible, key=eligible.get)
-    return PLAYSTYLE_ROLE_LABELS[top_role]
-
-
-def compute_player_playstyle(
+def compute_player_role_style(
     cs2_stats: dict[str, Any],
     *,
     nickname: str = "",
     player_id: str = "",
-) -> str:
-    """Стиль по скорингу из /players/{id}/stats/cs2 (только реальные поля API)."""
+) -> tuple[str, str]:
+    """ROLE + STYLE из /players/{id}/stats/cs2."""
     inputs = _extract_cs2_playstyle_inputs(cs2_stats)
-    scores = _compute_playstyle_scores(inputs)
-
-    style = _select_playstyle_from_scores(scores, inputs)
+    role_scores = _compute_role_scores(inputs)
+    top_role = max(role_scores, key=role_scores.get)
+    role_label = ROLE_LABELS[top_role]
+    style_label = _compute_aggression_style(inputs)
 
     logger.info(
-        "Playstyle selected nick=%s player_id=%s style=%s "
-        "entry=%s lurker=%s support=%s awper=%s rifler=%s carry=%s api_fields=%s",
+        "Role/style nick=%s player_id=%s role=%s style=%s "
+        "scores entry=%s awper=%s support=%s lurker=%s rifler=%s carry=%s "
+        "api_fields=%s",
         nickname,
         player_id,
-        style,
-        _format_playstyle_score(scores["entry"]),
-        _format_playstyle_score(scores["lurker"]),
-        _format_playstyle_score(scores["support"]),
-        _format_playstyle_score(scores["awper"]),
-        _format_playstyle_score(scores["rifler"]),
-        _format_playstyle_score(scores["carry"]),
+        role_label,
+        style_label,
+        _format_role_score(role_scores["entry"]),
+        _format_role_score(role_scores["awper"]),
+        _format_role_score(role_scores["support"]),
+        _format_role_score(role_scores["lurker"]),
+        _format_role_score(role_scores["rifler"]),
+        _format_role_score(role_scores["carry"]),
         list(inputs.fields_used),
     )
 
-    return style
+    return role_label, style_label
 
 
 def resolve_skill_level(player: dict[str, Any], current_elo: int | None) -> int:
@@ -2706,12 +2692,66 @@ def _clamp_weakness_score(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def _weakness_severity_label(score: float) -> str:
+def _weakness_rank_tier(score: float) -> tuple[str, str]:
     if score > 0.70:
-        return "главная уязвимость"
+        return "🔴", "критическая проблема"
     if score > 0.50:
-        return "заметная проблема"
-    return "слабая зона"
+        return "🟠", "заметная проблема"
+    return "🟡", "слабая проблема"
+
+
+def _format_weakness_line(category: str, score: float) -> str:
+    emoji, problem_label = _weakness_rank_tier(score)
+    label = WEAKNESS_LABELS[category]
+    return f"{emoji} {label} ({score:.2f}) — {problem_label}"
+
+
+def find_growth_zones(context: GrowthContext) -> list[str]:
+    """Слабые места: scoring 0–1, top 3 зоны выше порога 0.30 с ранжированием."""
+    scores = _compute_weakness_scores(context)
+
+    logger.info(
+        "Weakness scores nick=%s entry=%.2f ct_hold=%.2f clutch=%.2f "
+        "decision=%.2f mechanics=%.2f",
+        context.nickname,
+        scores["entry"],
+        scores["ct_hold"],
+        scores["clutch"],
+        scores["decision"],
+        scores["mechanics"],
+    )
+
+    qualified = [
+        (category, score)
+        for category, score in scores.items()
+        if score > WEAKNESS_SHOW_MIN
+    ]
+    if not qualified:
+        logger.info(
+            "Слабые места для %s: %s", context.nickname, [GROWTH_NO_ISSUES_MSG]
+        )
+        return [GROWTH_NO_ISSUES_MSG]
+
+    qualified.sort(
+        key=lambda item: (
+            -item[1],
+            _growth_tiebreak_seed(context.player_id, item[0]),
+        )
+    )
+    top_three = qualified[:3]
+    main_label = WEAKNESS_LABELS[top_three[0][0]]
+
+    result = [
+        f"🔥 ГЛАВНАЯ ПРОБЛЕМА: {main_label}",
+        "",
+        *[
+            _format_weakness_line(category, score)
+            for category, score in top_three
+        ],
+    ]
+
+    logger.info("Слабые места для %s: %s", context.nickname, result)
+    return result
 
 
 def _compute_weakness_scores(context: GrowthContext) -> dict[str, float]:
@@ -2783,54 +2823,6 @@ def _compute_weakness_scores(context: GrowthContext) -> dict[str, float]:
         "decision": round(decision_weakness, 2),
         "mechanics": round(mechanics_weakness, 2),
     }
-
-
-def _format_weakness_line(category: str, score: float) -> str:
-    label = WEAKNESS_LABELS[category]
-    severity = _weakness_severity_label(score)
-    return f"{label} ({score:.2f}) — {severity}"
-
-
-def find_growth_zones(context: GrowthContext) -> list[str]:
-    """Слабые места: scoring 0–1, top 2–3 зоны выше порога 0.30."""
-    scores = _compute_weakness_scores(context)
-
-    logger.info(
-        "Weakness scores nick=%s entry=%.2f ct_hold=%.2f clutch=%.2f "
-        "decision=%.2f mechanics=%.2f",
-        context.nickname,
-        scores["entry"],
-        scores["ct_hold"],
-        scores["clutch"],
-        scores["decision"],
-        scores["mechanics"],
-    )
-
-    qualified = [
-        (category, score)
-        for category, score in scores.items()
-        if score > WEAKNESS_SHOW_MIN
-    ]
-    if not qualified:
-        logger.info(
-            "Слабые места для %s: %s", context.nickname, [GROWTH_NO_ISSUES_MSG]
-        )
-        return [GROWTH_NO_ISSUES_MSG]
-
-    qualified.sort(
-        key=lambda item: (
-            -item[1],
-            _growth_tiebreak_seed(context.player_id, item[0]),
-        )
-    )
-    top_count = min(3, len(qualified))
-    result = [
-        _format_weakness_line(category, score)
-        for category, score in qualified[:top_count]
-    ]
-
-    logger.info("Слабые места для %s: %s", context.nickname, result)
-    return result
 
 
 def build_form_progress(older: PeriodStats, recent: PeriodStats) -> list[str]:
@@ -3088,13 +3080,14 @@ def build_user_progress(
     trend_direction = classify_trend_direction(older, recent)
     performance_rank = compute_performance_rank(recent)
     overall_form = compute_overall_form(performance_rank, trend_direction)
-    style = compute_player_playstyle(
+    player_role, player_style = compute_player_role_style(
         cs2_stats, nickname=nickname, player_id=player_id
     )
     growth_zones = find_growth_zones(growth_context)
 
     return ProgressReport(
-        style=style,
+        player_role=player_role,
+        player_style=player_style,
         performance_rank=performance_rank,
         older=older,
         recent=recent,
@@ -3122,7 +3115,7 @@ def format_progress_report(report: ProgressReport) -> str:
             "",
             "📈 ТВОЙ ПРОГРЕСС",
             "",
-            f"🏅 Стиль: {report.style}",
+            f"🏅 ROLE: {report.player_role} | STYLE: {report.player_style}",
             f"📊 Performance rank: {report.performance_rank}/100 (vs all Faceit)",
             "",
             f"📊 Последние {report.match_count} матчей:",
@@ -3153,10 +3146,9 @@ def format_progress_report(report: ProgressReport) -> str:
     lines.extend(["", f"📉 ТРЕНД: {report.trend_summary}"])
     lines.append(f"🎯 ИТОГОВАЯ ФОРМА: {report.overall_form}")
 
-    lines.extend(["", "🎯 СЛАБЫЕ МЕСТА:"])
+    lines.extend(["", "🎯 СЛАБЫЕ МЕСТА:", ""])
     for zone in report.growth_zones:
-        prefix = "" if zone.startswith("•") else "• "
-        lines.append(f"{prefix}{zone}")
+        lines.append(zone)
 
     return "\n".join(lines)
 
