@@ -70,21 +70,6 @@ SKILL_LEVEL_BENCHMARKS: dict[int, dict[str, float]] = {
     10: {"kd": 1.28, "avg_kills": 18.5, "hs_pct": 52.0, "win_rate": 53.0},
 }
 
-FACEIT_PLAYSTYLE_ROLE_RU: dict[str, str] = {
-    "entry_fragger": "Первое касание",
-    "entry": "Первое касание",
-    "entryfragger": "Первое касание",
-    "support": "Поддержка",
-    "awper": "Снайпер",
-    "awp": "Снайпер",
-    "clutcher": "Клатчер",
-    "lurker": "Скрытная игра",
-    "igl": "Капитан",
-    "roamer": "Свободный игрок",
-    "anchor": "Опорник",
-    "rifler": "Стрелок",
-}
-
 MATCH_ID_PATTERN = re.compile(
     r"(1-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     re.IGNORECASE,
@@ -2261,76 +2246,23 @@ def _period_stats_from_items(items: list[dict[str, Any]]) -> PeriodStats | None:
     )
 
 
-def _normalize_playstyle_token(value: str) -> str:
-    return re.sub(r"[\s\-]+", "_", value.strip().lower())
+@dataclass
+class PlaystyleMetrics:
+    opening_kills_avg: float
+    awp_kill_share: float
+    clutch_win_rate: float
+    flash_assists_avg: float
+    kd: float
+    avg_kills: float
+    match_count: int
 
 
-def _playstyle_role_from_token(token: str) -> str | None:
-    key = _normalize_playstyle_token(token)
-    if key in FACEIT_PLAYSTYLE_ROLE_RU:
-        return FACEIT_PLAYSTYLE_ROLE_RU[key]
-    for alias, label in FACEIT_PLAYSTYLE_ROLE_RU.items():
-        if alias in key or key in alias:
-            return label
-    return None
-
-
-def _extract_playstyle_from_mapping(mapping: dict[str, Any]) -> str | None:
-    for field in ("role", "playstyle", "main_role", "primary_role", "type", "name"):
-        raw = mapping.get(field)
-        if isinstance(raw, str):
-            label = _playstyle_role_from_token(raw)
-            if label:
-                return label
-    return None
-
-
-def extract_faceit_playstyle_role(cs2_stats: dict[str, Any]) -> str | None:
-    """Роль из /players/{id}/stats/cs2: player_skills, role, playstyle."""
-    for key in ("role", "playstyle"):
-        raw = cs2_stats.get(key)
-        if isinstance(raw, str):
-            label = _playstyle_role_from_token(raw)
-            if label:
-                return label
-
-    player_skills = cs2_stats.get("player_skills")
-    if isinstance(player_skills, dict):
-        label = _extract_playstyle_from_mapping(player_skills)
-        if label:
-            return label
-        for value in player_skills.values():
-            if isinstance(value, dict):
-                label = _extract_playstyle_from_mapping(value)
-                if label:
-                    return label
-            elif isinstance(value, str):
-                label = _playstyle_role_from_token(value)
-                if label:
-                    return label
-
-    for segment in cs2_stats.get("segments") or []:
-        seg_type = (segment.get("type") or "").lower()
-        if seg_type not in ("role", "playstyle", "player_skills", "skills"):
-            continue
-        stats = segment.get("stats")
-        if isinstance(stats, dict):
-            label = _extract_playstyle_from_mapping(stats)
-            if label:
-                return label
-
-    return None
-
-
-def infer_playstyle_from_match_stats(items: list[dict[str, Any]]) -> str | None:
-    """Эвристика по матчам, если роли в API нет."""
-    if not items:
-        return None
-
+def _playstyle_metrics_from_items(
+    items: list[dict[str, Any]], recent: PeriodStats
+) -> PlaystyleMetrics:
     first_kills_total = 0.0
-    entry_total = 0.0
-    entry_wins_total = 0.0
     sniper_total = 0.0
+    kills_total = 0.0
     flash_assists_total = 0.0
     clutch_wins = 0.0
     clutch_count = 0.0
@@ -2342,11 +2274,8 @@ def infer_playstyle_from_match_stats(items: list[dict[str, Any]]) -> str | None:
         first_kills_total += (
             _parse_optional_stat(stats, STAT_MATCH_FIRST_KILLS_KEYS) or 0.0
         )
-        entry = _parse_optional_stat(stats, STAT_TOTAL_ENTRY_COUNT_KEYS) or 0.0
-        entry_wins = _parse_optional_stat(stats, STAT_TOTAL_ENTRY_WINS_KEYS) or 0.0
-        entry_total += entry
-        entry_wins_total += entry_wins
         sniper_total += _parse_optional_stat(stats, STAT_SNIPER_KILLS_KEYS) or 0.0
+        kills_total += _parse_optional_stat(stats, STAT_KILLS_KEYS) or 0.0
         flash_assists_total += (
             _parse_optional_stat(stats, STAT_FLASH_ASSISTS_KEYS) or 0.0
         )
@@ -2357,50 +2286,87 @@ def infer_playstyle_from_match_stats(items: list[dict[str, Any]]) -> str | None:
             _parse_optional_stat(stats, STAT_1V2_COUNT_KEYS) or 0.0
         )
 
-    if count == 0:
-        return None
+    opening_avg = first_kills_total / count if count else recent.first_kills_avg
+    awp_share = sniper_total / kills_total if kills_total > 0 else 0.0
+    clutch_wr = (
+        clutch_wins / clutch_count
+        if clutch_count > 0
+        else (recent.clutch_1vx_win_rate or 0.0)
+    )
+    flash_avg = flash_assists_total / count if count else 0.0
 
-    first_kills_avg = first_kills_total / count
-    entry_avg = entry_total / count
-    sniper_avg = sniper_total / count
-    flash_assists_avg = flash_assists_total / count
-    entry_win_rate = entry_wins_total / entry_total if entry_total > 0 else 0.0
-    clutch_win_rate = clutch_wins / clutch_count if clutch_count >= 3 else 0.0
+    return PlaystyleMetrics(
+        opening_kills_avg=opening_avg,
+        awp_kill_share=awp_share,
+        clutch_win_rate=clutch_wr,
+        flash_assists_avg=flash_avg,
+        kd=recent.kd,
+        avg_kills=recent.avg_kills,
+        match_count=count,
+    )
 
-    scores: list[tuple[float, str]] = []
-    if first_kills_avg >= 2.2 or (entry_avg >= 3.5 and entry_win_rate >= 0.48):
-        scores.append((first_kills_avg * 2.0 + entry_win_rate * 5.0, "Первое касание"))
-    if sniper_avg >= 4.0:
-        scores.append((sniper_avg, "Снайпер"))
-    if clutch_win_rate >= 0.42:
-        scores.append((clutch_win_rate * 10.0, "Клатчер"))
-    if flash_assists_avg >= 0.35 or (
-        flash_assists_avg >= 0.2 and first_kills_avg < 1.8
-    ):
-        scores.append((flash_assists_avg * 8.0, "Поддержка"))
 
-    if not scores:
-        return None
+def _playstyle_proximity_scores(metrics: PlaystyleMetrics) -> dict[str, float]:
+    """Насколько статистика близка к порогам каждой роли (1.0 = порог достигнут)."""
+    lurker_score = 0.0
+    if metrics.opening_kills_avg < 1.2:
+        lurker_score += (1.2 - metrics.opening_kills_avg) / 1.2
+    if metrics.awp_kill_share < 0.15:
+        lurker_score += (0.15 - metrics.awp_kill_share) / 0.15
+    lurker_score = min(1.0, lurker_score / 2.0)
 
-    scores.sort(key=lambda item: item[0], reverse=True)
-    best_score, best_label = scores[0]
-    if len(scores) > 1 and scores[1][0] >= best_score * 0.85:
-        return None
-    if best_score < 2.5:
-        return None
-    return best_label
+    carry_kd = min(1.0, metrics.kd / 1.2) if metrics.kd > 0 else 0.0
+    carry_avg = min(1.0, metrics.avg_kills / 20.0) if metrics.avg_kills > 0 else 0.0
+
+    return {
+        "Entry Fragger": (
+            metrics.opening_kills_avg / 1.2 if metrics.opening_kills_avg > 0 else 0.0
+        ),
+        "AWPer": metrics.awp_kill_share / 0.30 if metrics.awp_kill_share > 0 else 0.0,
+        "Clutcher": (
+            metrics.clutch_win_rate / 0.50 if metrics.clutch_win_rate > 0 else 0.0
+        ),
+        "Support": (
+            metrics.flash_assists_avg / 0.5 if metrics.flash_assists_avg > 0 else 0.0
+        ),
+        "Carry": (carry_kd + carry_avg) / 2.0,
+        "Lurker": lurker_score,
+        "Rifler": 0.35,
+    }
 
 
 def compute_player_playstyle(
-    cs2_stats: dict[str, Any], items: list[dict[str, Any]]
+    items: list[dict[str, Any]], recent: PeriodStats
 ) -> str:
-    api_role = extract_faceit_playstyle_role(cs2_stats)
-    if api_role:
-        return api_role
-    inferred = infer_playstyle_from_match_stats(items)
-    if inferred:
-        return inferred
-    return "Не определён"
+    """Стиль только по статистике последних матчей."""
+    metrics = _playstyle_metrics_from_items(items, recent)
+    if metrics.match_count == 0 and metrics.kd <= 0:
+        return "Rifler"
+
+    qualified: list[tuple[float, str]] = []
+    if metrics.opening_kills_avg > 1.2:
+        qualified.append(
+            ("Entry Fragger", metrics.opening_kills_avg / 1.2)
+        )
+    if metrics.awp_kill_share > 0.30:
+        qualified.append(("AWPer", metrics.awp_kill_share / 0.30))
+    if metrics.clutch_win_rate > 0.50:
+        qualified.append(("Clutcher", metrics.clutch_win_rate / 0.50))
+    if metrics.flash_assists_avg > 0.5:
+        qualified.append(("Support", metrics.flash_assists_avg / 0.5))
+    if metrics.kd > 1.2 and metrics.avg_kills > 20:
+        qualified.append(
+            (
+                "Carry",
+                min(metrics.kd / 1.2, metrics.avg_kills / 20.0),
+            )
+        )
+
+    if qualified:
+        return max(qualified, key=lambda item: item[1])[0]
+
+    proximity = _playstyle_proximity_scores(metrics)
+    return max(proximity, key=proximity.get)
 
 
 def resolve_skill_level(player: dict[str, Any], current_elo: int | None) -> int:
@@ -2531,16 +2497,15 @@ def build_progress_changes(
         improved.append(
             (
                 avg_delta,
-                f"✅ Стал лучше размениваться: AVG вырос на {avg_delta:.1f} "
-                "убийств за игру",
+                f"✅ AVG вырос на {avg_delta:.1f} убийств за игру",
             )
         )
     elif avg_delta <= -0.5:
         declined.append(
             (
                 -avg_delta,
-                f"⚠️ Просадка: Размен: было {older.avg_kills:.1f} → "
-                f"стало {recent.avg_kills:.1f} убийств за игру",
+                f"⚠️ AVG упал: было {older.avg_kills:.1f} → "
+                f"стало {recent.avg_kills:.1f}",
             )
         )
 
@@ -2550,14 +2515,14 @@ def build_progress_changes(
             improved.append(
                 (
                     hs_delta,
-                    f"✅ Улучшилась стрельба: HS% вырос на {hs_delta:.0f}%",
+                    f"✅ HS% вырос на {hs_delta:.0f}%",
                 )
             )
         elif hs_delta <= -3:
             declined.append(
                 (
                     -hs_delta,
-                    f"⚠️ Просадка: Стрельба: было {older.hs_pct:.0f}% → "
+                    f"⚠️ HS% упал: было {older.hs_pct:.0f}% → "
                     f"стало {recent.hs_pct:.0f}%",
                 )
             )
@@ -2567,7 +2532,7 @@ def build_progress_changes(
         improved.append(
             (
                 kd_delta,
-                f"✅ Улучшился K/D: вырос на {kd_delta:.2f} "
+                f"✅ K/D вырос на {kd_delta:.2f} "
                 f"({older.kd:.2f} → {recent.kd:.2f})",
             )
         )
@@ -2575,7 +2540,7 @@ def build_progress_changes(
         declined.append(
             (
                 -kd_delta,
-                f"⚠️ Просадка: K/D: было {older.kd:.2f} → стало {recent.kd:.2f}",
+                f"⚠️ K/D упал: было {older.kd:.2f} → стало {recent.kd:.2f}",
             )
         )
 
@@ -2589,15 +2554,14 @@ def build_progress_changes(
             improved.append(
                 (
                     new_pct - old_pct,
-                    f"✅ Улучшились клатчи: winrate в 1vX вырос на "
-                    f"{new_pct - old_pct:.0f}%",
+                    f"✅ clutch winrate в 1vX вырос на {new_pct - old_pct:.0f}%",
                 )
             )
         elif old_pct - new_pct >= 8:
             declined.append(
                 (
                     old_pct - new_pct,
-                    f"⚠️ Просадка: Клатчи: winrate в 1vX упал с "
+                    f"⚠️ clutch winrate в 1vX упал с "
                     f"{old_pct:.0f}% → {new_pct:.0f}%",
                 )
             )
@@ -2609,15 +2573,14 @@ def build_progress_changes(
             improved.append(
                 (
                     new_pct - old_pct,
-                    f"✅ Улучшилось первое касание: winrate вырос на "
-                    f"{new_pct - old_pct:.0f}%",
+                    f"✅ entry winrate вырос на {new_pct - old_pct:.0f}%",
                 )
             )
         elif old_pct - new_pct >= 8:
             declined.append(
                 (
                     old_pct - new_pct,
-                    f"⚠️ Просадка: Первое касание: было {old_pct:.0f}% → "
+                    f"⚠️ entry winrate упал: было {old_pct:.0f}% → "
                     f"стало {new_pct:.0f}%",
                 )
             )
@@ -2627,14 +2590,14 @@ def build_progress_changes(
         improved.append(
             (
                 fk_delta,
-                f"✅ Больше opening kills: +{fk_delta:.1f} за матч",
+                f"✅ opening kills: +{fk_delta:.1f} за матч",
             )
         )
     elif fk_delta <= -0.3:
         declined.append(
             (
                 -fk_delta,
-                f"⚠️ Просадка: Opening kills: было {older.first_kills_avg:.1f} → "
+                f"⚠️ opening kills упали: было {older.first_kills_avg:.1f} → "
                 f"стало {recent.first_kills_avg:.1f}",
             )
         )
@@ -2647,90 +2610,91 @@ def build_progress_changes(
     )
 
 
-def find_growth_zones(
-    older: PeriodStats,
-    recent: PeriodStats,
-    lifetime_hs_pct: float | None,
-) -> list[str]:
-    """1–2 самые проблемные зоны роста по навыкам."""
+GROWTH_ZONE_MIN_SEVERITY = 4.0
+
+
+def find_growth_zones(older: PeriodStats, recent: PeriodStats) -> list[str]:
+    """1–2 зоны роста по самым сильным просадкам между периодами."""
     issues: list[tuple[float, str]] = []
+
+    if recent.hs_pct > 0 and older.hs_pct > 0:
+        hs_drop = older.hs_pct - recent.hs_pct
+        if hs_drop >= 3:
+            issues.append(
+                (
+                    hs_drop * 1.2,
+                    f"Аим: HS% упал с {older.hs_pct:.0f}% → {recent.hs_pct:.0f}%",
+                )
+            )
+
+    opening_death_rise = (
+        (recent.opening_death_rate - older.opening_death_rate) * 100
+    )
+    if opening_death_rise >= 3:
+        issues.append(
+            (
+                opening_death_rise * 1.1,
+                "Позиционная игра: чаще умираешь в первые секунды раунда за CT",
+            )
+        )
 
     if (
         recent.clutch_1vx_win_rate is not None
         and older.clutch_1vx_win_rate is not None
     ):
-        drop = (older.clutch_1vx_win_rate - recent.clutch_1vx_win_rate) * 100
-        if drop >= 8:
+        clutch_drop = (older.clutch_1vx_win_rate - recent.clutch_1vx_win_rate) * 100
+        if clutch_drop >= 6:
             old_pct = older.clutch_1vx_win_rate * 100
             new_pct = recent.clutch_1vx_win_rate * 100
             issues.append(
                 (
-                    drop,
-                    f"Клатчи: winrate в 1vX упал с {old_pct:.0f}% → {new_pct:.0f}%",
-                )
-            )
-        elif recent.clutch_1vx_win_rate < 0.35:
-            issues.append(
-                (
-                    35 - recent.clutch_1vx_win_rate * 100,
-                    f"Клатчи: низкий winrate в 1vX ({recent.clutch_1vx_win_rate * 100:.0f}%)",
+                    clutch_drop * 1.15,
+                    f"Клатчи: clutch winrate в 1vX упал с "
+                    f"{old_pct:.0f}% → {new_pct:.0f}%",
                 )
             )
 
-    opening_rise = (recent.opening_death_rate - older.opening_death_rate) * 100
-    if opening_rise >= 5 or recent.opening_death_rate >= 0.22:
-        severity = max(opening_rise, recent.opening_death_rate * 100 - 15)
+    if (
+        recent.entry_win_rate is not None
+        and older.entry_win_rate is not None
+    ):
+        entry_drop = (older.entry_win_rate - recent.entry_win_rate) * 100
+        if entry_drop >= 6:
+            old_pct = older.entry_win_rate * 100
+            new_pct = recent.entry_win_rate * 100
+            issues.append(
+                (
+                    entry_drop * 1.1,
+                    f"Entry: entry winrate упал с {old_pct:.0f}% → {new_pct:.0f}%",
+                )
+            )
+
+    avg_drop = older.avg_kills - recent.avg_kills
+    if avg_drop >= 0.8:
         issues.append(
             (
-                severity,
-                "Позиционная игра: частые смерти в первые секунды раунда за CT",
+                avg_drop * 2.0,
+                f"Размены: AVG упал с {older.avg_kills:.1f} → {recent.avg_kills:.1f}",
             )
         )
 
-    if recent.entry_win_rate is not None:
-        if older.entry_win_rate is not None:
-            entry_drop = (older.entry_win_rate - recent.entry_win_rate) * 100
-            if entry_drop >= 8:
-                old_pct = older.entry_win_rate * 100
-                new_pct = recent.entry_win_rate * 100
-                issues.append(
-                    (
-                        entry_drop,
-                        f"Первое касание: было {old_pct:.0f}% → стало {new_pct:.0f}%",
-                    )
-                )
-        if recent.entry_win_rate < 0.45:
-            issues.append(
-                (
-                    45 - recent.entry_win_rate * 100,
-                    f"Первое касание: низкий winrate ({recent.entry_win_rate * 100:.0f}%)",
-                )
-            )
-
-    tempo_drop = older.early_attack_impact - recent.early_attack_impact
-    if tempo_drop >= 0.4:
+    kd_drop = older.kd - recent.kd
+    if kd_drop >= 0.1:
         issues.append(
             (
-                tempo_drop * 10,
-                "Темп игры: мало импакта в первые 30 сек раунда в атаке",
-            )
-        )
-
-    benchmark_hs = lifetime_hs_pct if lifetime_hs_pct else 50.0
-    if recent.hs_pct > 0 and recent.hs_pct < benchmark_hs - 8:
-        issues.append(
-            (
-                benchmark_hs - recent.hs_pct,
-                f"Стрельба: низкий HS% ({recent.hs_pct:.0f}% vs ~{benchmark_hs:.0f}% "
-                "для твоего уровня)",
+                kd_drop * 15.0,
+                f"K/D: упал с {older.kd:.2f} → {recent.kd:.2f}",
             )
         )
 
     if not issues:
-        return []
+        return ["Явных зон роста нет, продолжай в том же духе"]
 
     issues.sort(key=lambda item: item[0], reverse=True)
-    return [message for _, message in issues[:2]]
+    top = [message for severity, message in issues if severity >= GROWTH_ZONE_MIN_SEVERITY][:2]
+    if top:
+        return top
+    return ["Явных зон роста нет, продолжай в том же духе"]
 
 
 def collect_player_game_stat_items(
@@ -2777,13 +2741,6 @@ def build_user_progress(
 
     cs2_stats = service.get_player_cs2_stats(player_id)
     service.get_player_history(player_id, limit=requested_matches)
-    lifetime_hs_raw = _first_present(cs2_stats.get("lifetime") or {}, STAT_HS_KEYS)
-    lifetime_hs_pct: float | None = None
-    if lifetime_hs_raw is not None:
-        try:
-            lifetime_hs_pct = _as_percent(_parse_float(lifetime_hs_raw))
-        except ValueError:
-            lifetime_hs_pct = None
 
     items = collect_player_game_stat_items(service, player_id, requested_matches)
     available = len(items)
@@ -2826,8 +2783,8 @@ def build_user_progress(
     benchmarks = get_level_benchmarks(cs2_stats, skill_level)
     improved, declined = build_progress_changes(older, recent)
     form_score = compute_form_score(recent, benchmarks)
-    style = compute_player_playstyle(cs2_stats, items)
-    growth_zones = find_growth_zones(older, recent, lifetime_hs_pct)
+    style = compute_player_playstyle(recent_items, recent)
+    growth_zones = find_growth_zones(older, recent)
 
     return ProgressReport(
         style=style,
@@ -2894,7 +2851,7 @@ def format_progress_report(report: ProgressReport) -> str:
         for zone in report.growth_zones:
             lines.append(f"• {zone}")
     else:
-        lines.append("• — явных слабых зон не найдено")
+        lines.append("• Явных зон роста нет, продолжай в том же духе")
 
     return "\n".join(lines)
 
