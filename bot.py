@@ -9,6 +9,7 @@ import logging
 import re
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -32,8 +33,10 @@ HEALTH_PORT = 10000
 RECENT_MAP_MATCHES_LIMIT = 15
 GAME_STATS_FETCH_LIMIT = 40
 MIN_MAP_MATCHES_FOR_SKILL = 3
-RECENT_TEAM_MATCHES = 10
-MAP_POOL_TOP_N = 2
+MAP_POOL_MATCHES_LIMIT = 20
+MIN_MAP_MATCHES_FOR_REC = 3
+SIDE_STYLE_MATCHES_LIMIT = 8
+MIN_SIDE_STYLE_MATCHES = 3
 
 MATCH_ID_PATTERN = re.compile(
     r"(1-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
@@ -173,6 +176,48 @@ FALLBACK_SITES = ("B", "A", "Mid", "B", "A")
 STAT_KD_KEYS = ("Average K/D Ratio", "K/D Ratio", "Average K/D", "kd_ratio")
 STAT_ADR_KEYS = ("ADR", "Average ADR", "Average Damage / Round", "Average Damage per Round")
 STAT_HS_KEYS = ("Average Headshots %", "Headshots %", "Headshot %", "HS %")
+STAT_WIN_RATE_KEYS = ("Win Rate %",)
+STAT_1V2_WIN_KEYS = ("1v2 Win Rate",)
+STAT_1V1_WIN_KEYS = ("1v1 Win Rate",)
+STAT_ENTRY_RATE_KEYS = ("Entry Rate", "Match Entry Rate")
+STAT_ENTRY_SUCCESS_KEYS = ("Entry Success Rate", "Match Entry Success Rate")
+STAT_TOTAL_ROUNDS_EXT_KEYS = ("Total Rounds with extended stats", "Rounds")
+STAT_TOTAL_ENTRY_COUNT_KEYS = ("Total Entry Count", "Entry Count")
+STAT_TOTAL_ENTRY_WINS_KEYS = ("Total Entry Wins", "Entry Wins")
+STAT_FIRST_DEATH_KEYS = (
+    "First Death Rate",
+    "Opening Death Rate",
+    "First Deaths %",
+    "First Death Percent",
+)
+STAT_FLASH_VULN_KEYS = (
+    "Flash Death Rate",
+    "Deaths After Flash %",
+    "Flash Vulnerability",
+    "Deaths While Flashed %",
+)
+STAT_MATCH_ROUNDS_KEYS = ("Rounds",)
+STAT_MATCH_DEATHS_KEYS = ("Deaths",)
+STAT_MATCH_FIRST_KILLS_KEYS = ("First Kills",)
+STAT_PLANTS_KEYS = ("Bomb Plants", "Plants")
+STAT_DEFUSES_KEYS = ("Bomb Defuses", "Defuses")
+STAT_PISTOL_KILLS_KEYS = ("Pistol Kills",)
+STAT_UTILITY_PER_ROUND_KEYS = ("Utility Usage per Round",)
+STAT_FLASHES_PER_ROUND_KEYS = ("Flashes per Round in a Match", "Flashes per Round")
+
+# Человекочитаемые названия зон для паттернов CT/T
+MAP_ZONE_LABELS: dict[str, dict[str, str]] = {
+    "de_mirage": {"A": "A", "B": "banana", "Mid": "mid"},
+    "de_dust2": {"A": "Long/A", "B": "B", "Mid": "mid"},
+    "de_inferno": {"A": "A", "B": "banana", "Mid": "mid"},
+    "de_nuke": {"A": "A/yard", "B": "B/ramp", "Mid": "mid"},
+    "de_overpass": {"A": "A", "B": "B", "Mid": "mid"},
+    "de_ancient": {"A": "A", "B": "B", "Mid": "mid"},
+    "de_anubis": {"A": "A", "B": "B", "Mid": "mid"},
+    "de_vertigo": {"A": "A", "B": "B", "Mid": "mid"},
+    "de_cache": {"A": "A", "B": "B", "Mid": "mid"},
+    "de_train": {"A": "A", "B": "B", "Mid": "mid"},
+}
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -215,45 +260,79 @@ class MapSkill:
 
 
 @dataclass
+class AnchorDefenseStats:
+    hold_rating: float | None
+    success_defend: float | None
+    first_death_percent: float | None
+    flash_vulnerability: float | None
+
+
+@dataclass
+class AttackAdvice:
+    site: str
+    anchor: "AnalyzedPlayer"
+    stats: AnchorDefenseStats
+    verdict: str
+
+
+@dataclass
 class AnalyzedPlayer:
     nickname: str
     player_id: str
     skill: MapSkill
     site: str
     site_source: str
+    defense: AnchorDefenseStats | None = None
 
 
 @dataclass
-class MapPoolEntry:
+class MapRecommendation:
     map_key: str
     display_name: str
-    wins: int
-    played: int
-
-    @property
-    def win_rate(self) -> float:
-        if self.played == 0:
-            return 0.0
-        return self.wins / self.played * 100
+    action: str
+    opponent_win_rate: float
+    user_win_rate: float
+    verdict: str
 
 
 @dataclass
 class MapPoolAnalysis:
-    entries: list[MapPoolEntry]
+    recommendations: list[MapRecommendation]
 
-    @property
-    def worst(self) -> list[MapPoolEntry]:
-        if not self.entries:
-            return []
-        return sorted(self.entries, key=lambda e: (e.win_rate, e.played))[:MAP_POOL_TOP_N]
 
-    @property
-    def best(self) -> list[MapPoolEntry]:
-        if not self.entries:
-            return []
-        return sorted(
-            self.entries, key=lambda e: (-e.win_rate, -e.played)
-        )[:MAP_POOL_TOP_N]
+@dataclass
+class SidePlaystyle:
+    side: str
+    lines: list[str]
+
+
+@dataclass
+class TeamPlaystyleAnalysis:
+    map_display_name: str
+    ct: SidePlaystyle | None = None
+    t: SidePlaystyle | None = None
+
+
+@dataclass
+class AggregatedPlaystyleMetrics:
+    match_count: int
+    total_rounds: float
+    entry_rate: float
+    first_kills_per_round: float
+    plants_per_round: float
+    defuses_per_round: float
+    utility_per_round: float
+    pistol_kills_per_round: float
+    avg_round_seconds: float
+    fast_round_pct: float
+    execute_tendency: float
+    default_tendency: float
+    split_tendency: float
+    zone_pressure: dict[str, float]
+    stack_site: str | None
+    stack_players: int
+    ct_push_site: str | None
+    ct_push_pct: float
 
 
 @dataclass
@@ -265,12 +344,15 @@ class AnalysisResult:
     weakest: AnalyzedPlayer
     strongest: AnalyzedPlayer
     map_pool: MapPoolAnalysis | None
+    attack_advice: AttackAdvice | None = None
+    playstyle: TeamPlaystyleAnalysis | None = None
 
 
 class FaceitService:
     def __init__(self, api_key: str) -> None:
         self._headers = {"Authorization": f"Bearer {api_key}"}
         self._match_stats_cache: dict[str, dict[str, Any]] = {}
+        self._player_cs2_stats_cache: dict[str, dict[str, Any]] = {}
 
     def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None) -> Any:
         url = f"{FACEIT_API_BASE}{path}"
@@ -311,7 +393,11 @@ class FaceitService:
         return self._match_stats_cache[match_id]
 
     def get_player_cs2_stats(self, player_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/players/{player_id}/stats/cs2")
+        if player_id not in self._player_cs2_stats_cache:
+            self._player_cs2_stats_cache[player_id] = self._request(
+                "GET", f"/players/{player_id}/stats/cs2"
+            )
+        return self._player_cs2_stats_cache[player_id]
 
     def get_player_game_stats(
         self, player_id: str, *, offset: int = 0, limit: int = GAME_STATS_FETCH_LIMIT
@@ -343,6 +429,20 @@ def _parse_float(value: Any, default: float | None = None) -> float:
             return default
         raise ValueError("пустое значение")
     return float(text)
+
+
+def _parse_optional_stat(stats: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    raw = _first_present(stats, keys)
+    if raw is None:
+        return None
+    try:
+        return _parse_float(raw)
+    except ValueError:
+        return None
+
+
+def _as_percent(value: float) -> float:
+    return value * 100 if value <= 1 else value
 
 
 def normalize_map_key(raw_map: str | None) -> str | None:
@@ -451,6 +551,17 @@ def get_opponent_roster(match: dict[str, Any], user_nickname: str) -> list[dict[
     if not roster:
         raise ValueError("Состав команды соперника пуст")
     return roster
+
+
+def get_user_from_match(
+    match: dict[str, Any], user_nickname: str
+) -> dict[str, Any] | None:
+    user_lower = user_nickname.lower()
+    for team in (match.get("teams") or {}).values():
+        for player in team.get("roster") or []:
+            if (player.get("nickname") or "").lower() == user_lower:
+                return player
+    return None
 
 
 def get_map_segment_stats(stats_payload: dict[str, Any], map_key: str) -> dict[str, Any]:
@@ -673,12 +784,29 @@ def parse_match_win(stats: dict[str, Any]) -> bool | None:
         return None
 
 
-def collect_opponent_recent_matches(
-    service: FaceitService, player_ids: list[str], limit: int = RECENT_TEAM_MATCHES
-) -> list[tuple[str, dict[str, Any]]]:
-    """Уникальные последние матчи соперников (match_id, item из game stats)."""
+def _match_key_from_game_item(item: dict[str, Any], player_id: str) -> str:
+    match_id = item.get("match_id")
+    if match_id:
+        return str(match_id)
+    stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
+    match_id = stats.get("Match Id") or stats.get("match_id")
+    if match_id:
+        return str(match_id)
+    return (
+        f"{player_id}:{stats.get('Created At')}:"
+        f"{stats.get('Map') or stats.get('map')}"
+    )
+
+
+def collect_recent_game_stat_items(
+    service: FaceitService,
+    player_ids: list[str],
+    *,
+    limit: int = MAP_POOL_MATCHES_LIMIT,
+) -> list[dict[str, Any]]:
+    """Последние уникальные матчи из /players/{id}/games/cs2/stats."""
     seen: set[str] = set()
-    ordered: list[tuple[str, dict[str, Any]]] = []
+    ordered: list[dict[str, Any]] = []
 
     for player_id in player_ids:
         if len(ordered) >= limit:
@@ -688,43 +816,30 @@ def collect_opponent_recent_matches(
         except (FaceitNotFoundError, FaceitAPIError):
             continue
         for item in payload.get("items") or []:
-            match_id = item.get("match_id")
-            if not match_id or match_id in seen:
-                continue
-            seen.add(match_id)
-            ordered.append((match_id, item))
             if len(ordered) >= limit:
                 break
+            match_key = _match_key_from_game_item(item, player_id)
+            if match_key in seen:
+                continue
+            seen.add(match_key)
+            ordered.append(item)
 
     return ordered
 
 
-def analyze_opponent_map_pool(
-    service: FaceitService, player_ids: list[str]
-) -> MapPoolAnalysis | None:
-    """Винрейт по картам за последние RECENT_TEAM_MATCHES матчей соперников."""
+def build_map_winrates_from_game_items(
+    items: list[dict[str, Any]],
+) -> dict[str, dict[str, int]]:
+    """map_key → {wins, played} из items game stats."""
     pool: dict[str, dict[str, int]] = {}
 
-    for match_id, item in collect_opponent_recent_matches(service, player_ids):
-        try:
-            match_stats = service.get_match_stats(match_id)
-        except (FaceitNotFoundError, FaceitAPIError):
-            continue
-
-        map_key = normalize_map_key(get_map_from_stats(match_stats))
+    for item in items:
+        stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
+        map_key = normalize_map_key(stats.get("Map") or stats.get("map"))
         if not map_key:
             continue
 
-        won: bool | None = None
-        for player_id in player_ids:
-            pstats = extract_player_match_stats(match_stats, player_id)
-            if pstats:
-                won = parse_match_win(pstats)
-                break
-        if won is None:
-            item_stats = item.get("stats")
-            if isinstance(item_stats, dict):
-                won = parse_match_win(item_stats)
+        won = parse_match_win(stats)
         if won is None:
             continue
 
@@ -733,25 +848,468 @@ def analyze_opponent_map_pool(
         if won:
             bucket["wins"] += 1
 
-    if not pool:
+    return pool
+
+
+def classify_map_recommendation(
+    opponent_win_rate: float, user_win_rate: float
+) -> tuple[str, str]:
+    gap = user_win_rate - opponent_win_rate
+
+    if opponent_win_rate >= 60 and user_win_rate <= 40:
+        return "ban", "100% бан"
+    if opponent_win_rate >= 55 and user_win_rate <= 45 and gap <= -10:
+        return "ban", "100% бан"
+
+    if opponent_win_rate <= 30 and user_win_rate >= 55:
+        return "pick", "уверенный пик"
+    if opponent_win_rate <= 40 and user_win_rate >= 50 and gap >= 15:
+        return "pick", "уверенный пик"
+
+    return "decider", "50/50, зависит от формы"
+
+
+def build_map_recommendations(
+    opponent_pool: dict[str, dict[str, int]],
+    user_pool: dict[str, dict[str, int]],
+) -> list[MapRecommendation]:
+    recommendations: list[MapRecommendation] = []
+
+    for map_key, opp_data in opponent_pool.items():
+        user_data = user_pool.get(map_key)
+        if not user_data:
+            continue
+        if (
+            opp_data["played"] < MIN_MAP_MATCHES_FOR_REC
+            or user_data["played"] < MIN_MAP_MATCHES_FOR_REC
+        ):
+            continue
+
+        opponent_win_rate = opp_data["wins"] / opp_data["played"] * 100
+        user_win_rate = user_data["wins"] / user_data["played"] * 100
+        action, verdict = classify_map_recommendation(
+            opponent_win_rate, user_win_rate
+        )
+        recommendations.append(
+            MapRecommendation(
+                map_key=map_key,
+                display_name=format_map_name(map_key),
+                action=action,
+                opponent_win_rate=opponent_win_rate,
+                user_win_rate=user_win_rate,
+                verdict=verdict,
+            )
+        )
+
+    action_order = {"ban": 0, "pick": 1, "decider": 2}
+    return sorted(
+        recommendations,
+        key=lambda rec: (
+            action_order.get(rec.action, 3),
+            -abs(rec.user_win_rate - rec.opponent_win_rate),
+            rec.display_name,
+        ),
+    )
+
+
+def analyze_map_pool(
+    service: FaceitService,
+    opponent_player_ids: list[str],
+    user_player_id: str,
+) -> MapPoolAnalysis | None:
+    """Винрейт по картам за последние MAP_POOL_MATCHES_LIMIT матчей."""
+    opponent_items = collect_recent_game_stat_items(service, opponent_player_ids)
+    user_items = collect_recent_game_stat_items(service, [user_player_id])
+
+    if not opponent_items or not user_items:
         return None
 
-    entries = [
-        MapPoolEntry(
-            map_key=map_key,
-            display_name=format_map_name(map_key),
-            wins=data["wins"],
-            played=data["played"],
+    opponent_pool = build_map_winrates_from_game_items(opponent_items)
+    user_pool = build_map_winrates_from_game_items(user_items)
+    recommendations = build_map_recommendations(opponent_pool, user_pool)
+
+    if not recommendations:
+        return None
+    return MapPoolAnalysis(recommendations=recommendations)
+
+
+def format_map_recommendations(analysis: MapPoolAnalysis) -> list[str]:
+    action_labels = {
+        "ban": "❌ BAN",
+        "pick": "✅ PICK",
+        "decider": "⚠️ DECIDER",
+    }
+    lines = ["", "🗺 Карты:"]
+
+    for rec in analysis.recommendations:
+        label = action_labels.get(rec.action, rec.action.upper())
+        lines.extend(
+            [
+                f"{label} {rec.display_name}",
+                f"— винрейт соперника: {rec.opponent_win_rate:.0f}%",
+                f"— твой винрейт: {rec.user_win_rate:.0f}%",
+                f"— вердикт: {rec.verdict}",
+                "",
+            ]
         )
-        for map_key, data in pool.items()
-    ]
-    return MapPoolAnalysis(entries=entries)
+
+    if lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def extract_opponent_team_match_stats(
+    match_stats: dict[str, Any], opponent_player_ids: set[str]
+) -> tuple[float, list[tuple[str, dict[str, Any]]]]:
+    """Раунды матча и player_stats соперников (player_id, stats)."""
+    rounds = 0.0
+    players: list[tuple[str, dict[str, Any]]] = []
+
+    for round_data in match_stats.get("rounds") or []:
+        round_stats = round_data.get("round_stats") or {}
+        rounds = _parse_float(
+            _first_present(round_stats, STAT_MATCH_ROUNDS_KEYS), default=0.0
+        )
+        for team in round_data.get("teams") or []:
+            for player in team.get("players") or []:
+                player_id = player.get("player_id")
+                if player_id in opponent_player_ids:
+                    stats = player.get("player_stats") or {}
+                    if stats:
+                        players.append((player_id, stats))
+
+    return rounds, players
+
+
+def collect_opponent_map_match_bundles(
+    service: FaceitService,
+    opponent_player_ids: list[str],
+    map_key: str,
+    *,
+    limit: int = SIDE_STYLE_MATCHES_LIMIT,
+) -> list[dict[str, Any]]:
+    """Последние матчи соперника на карте с полной match stats."""
+    opponent_ids = set(opponent_player_ids)
+    seen: set[str] = set()
+    bundles: list[dict[str, Any]] = []
+
+    for player_id in opponent_player_ids:
+        if len(bundles) >= limit:
+            break
+        try:
+            payload = service.get_player_game_stats(player_id, limit=GAME_STATS_FETCH_LIMIT)
+        except (FaceitNotFoundError, FaceitAPIError):
+            continue
+
+        for item in payload.get("items") or []:
+            if len(bundles) >= limit:
+                break
+            item_stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
+            if normalize_map_key(item_stats.get("Map") or item_stats.get("map")) != map_key:
+                continue
+
+            match_key = _match_key_from_game_item(item, player_id)
+            if match_key in seen:
+                continue
+
+            try:
+                match_stats = service.get_match_stats(match_key)
+            except (FaceitNotFoundError, FaceitAPIError):
+                continue
+
+            rounds, team_stats = extract_opponent_team_match_stats(
+                match_stats, opponent_ids
+            )
+            if rounds <= 0 or len(team_stats) < 3:
+                continue
+
+            seen.add(match_key)
+            bundles.append(
+                {
+                    "rounds": rounds,
+                    "players": team_stats,
+                }
+            )
+
+    return bundles
+
+
+def _zone_label(map_key: str, site: str) -> str:
+    return MAP_ZONE_LABELS.get(map_key, {}).get(site, site)
+
+
+def _estimate_avg_round_seconds(
+    entry_rate: float,
+    first_kills_per_round: float,
+    plants_per_round: float,
+    utility_per_round: float,
+) -> float:
+    seconds = (
+        72.0
+        - entry_rate * 48.0
+        - first_kills_per_round * 6.0
+        - plants_per_round * 14.0
+        + max(0.0, utility_per_round - 0.25) * 8.0
+    )
+    return max(24.0, min(88.0, seconds))
+
+
+def _estimate_fast_round_pct(
+    entry_rate: float, first_kills_per_round: float, avg_round_seconds: float
+) -> float:
+    return min(
+        85.0,
+        max(
+            12.0,
+            entry_rate * 90.0
+            + first_kills_per_round * 45.0
+            + max(0.0, 45.0 - avg_round_seconds) * 1.4,
+        ),
+    )
+
+
+def aggregate_playstyle_metrics(
+    bundles: list[dict[str, Any]],
+    players: list[AnalyzedPlayer],
+    map_key: str,
+) -> AggregatedPlaystyleMetrics | None:
+    if not bundles:
+        return None
+
+    player_sites = {player.player_id: player.site for player in players}
+    site_counts = Counter(player.site for player in players)
+    stack_site, stack_players = None, 0
+    for site, count in site_counts.items():
+        if count >= 4:
+            stack_site, stack_players = site, count
+            break
+
+    total_rounds = 0.0
+    total_entry = 0.0
+    total_first_kills = 0.0
+    total_plants = 0.0
+    total_defuses = 0.0
+    total_utility = 0.0
+    total_pistol = 0.0
+    zone_pressure = {"A": 0.0, "B": 0.0, "Mid": 0.0}
+    ct_push_by_site = {"A": 0.0, "B": 0.0, "Mid": 0.0}
+
+    for bundle in bundles:
+        rounds = float(bundle["rounds"])
+        if rounds <= 0:
+            continue
+        total_rounds += rounds
+
+        for player_id, stats in bundle["players"]:
+            site = player_sites.get(player_id, "Mid")
+            entry = _parse_optional_stat(stats, STAT_TOTAL_ENTRY_COUNT_KEYS) or 0.0
+            first_kills = _parse_optional_stat(stats, STAT_MATCH_FIRST_KILLS_KEYS) or 0.0
+            plants = _parse_optional_stat(stats, STAT_PLANTS_KEYS) or 0.0
+            defuses = _parse_optional_stat(stats, STAT_DEFUSES_KEYS) or 0.0
+            utility = (
+                (_parse_optional_stat(stats, STAT_UTILITY_PER_ROUND_KEYS) or 0.0)
+                * rounds
+            )
+            pistol = _parse_optional_stat(stats, STAT_PISTOL_KILLS_KEYS) or 0.0
+
+            total_entry += entry
+            total_first_kills += first_kills
+            total_plants += plants
+            total_defuses += defuses
+            total_utility += utility
+            total_pistol += pistol
+
+            zone_pressure[site] += entry * 2.0 + plants * 3.0 + first_kills * 1.5
+            ct_push_by_site[site] += entry + first_kills * 0.5
+
+    if total_rounds <= 0:
+        return None
+
+    entry_rate = total_entry / total_rounds
+    first_kills_per_round = total_first_kills / total_rounds
+    plants_per_round = total_plants / total_rounds
+    defuses_per_round = total_defuses / total_rounds
+    utility_per_round = total_utility / total_rounds
+    pistol_kills_per_round = total_pistol / total_rounds
+
+    avg_round_seconds = _estimate_avg_round_seconds(
+        entry_rate, first_kills_per_round, plants_per_round, utility_per_round
+    )
+    fast_round_pct = _estimate_fast_round_pct(
+        entry_rate, first_kills_per_round, avg_round_seconds
+    )
+
+    execute_tendency = min(
+        1.0,
+        entry_rate * 1.6 + utility_per_round * 0.9 + plants_per_round * 2.5,
+    )
+    default_tendency = max(
+        0.0,
+        min(
+            1.0,
+            (1.0 - execute_tendency) * 0.85
+            + (0.25 if entry_rate < 0.14 else 0.0)
+            + (0.15 if utility_per_round < 0.22 else 0.0),
+        ),
+    )
+
+    zone_total = sum(zone_pressure.values()) or 1.0
+    zone_shares = {site: value / zone_total for site, value in zone_pressure.items()}
+    split_tendency = 1.0 - max(zone_shares.values())
+
+    ct_push_site = max(ct_push_by_site, key=ct_push_by_site.get) if ct_push_by_site else None
+    ct_push_pct = min(
+        85.0,
+        (ct_push_by_site.get(ct_push_site or "Mid", 0.0) / total_rounds) * 120.0,
+    )
+
+    return AggregatedPlaystyleMetrics(
+        match_count=len(bundles),
+        total_rounds=total_rounds,
+        entry_rate=entry_rate,
+        first_kills_per_round=first_kills_per_round,
+        plants_per_round=plants_per_round,
+        defuses_per_round=defuses_per_round,
+        utility_per_round=utility_per_round,
+        pistol_kills_per_round=pistol_kills_per_round,
+        avg_round_seconds=avg_round_seconds,
+        fast_round_pct=fast_round_pct,
+        execute_tendency=execute_tendency,
+        default_tendency=default_tendency,
+        split_tendency=split_tendency,
+        zone_pressure=zone_pressure,
+        stack_site=stack_site,
+        stack_players=stack_players,
+        ct_push_site=ct_push_site,
+        ct_push_pct=ct_push_pct,
+    )
+
+
+def _dominant_attack_zone(metrics: AggregatedPlaystyleMetrics) -> str:
+    if not metrics.zone_pressure:
+        return "B"
+    return max(metrics.zone_pressure, key=metrics.zone_pressure.get)
+
+
+def generate_ct_playstyle_lines(
+    metrics: AggregatedPlaystyleMetrics, map_key: str
+) -> list[str]:
+    lines: list[str] = []
+
+    if metrics.ct_push_pct >= 40 and metrics.ct_push_site:
+        label = _zone_label(map_key, metrics.ct_push_site)
+        lines.append(
+            f"— Часто пушат {label} ({metrics.ct_push_pct:.0f}% раундов)"
+        )
+
+    if metrics.stack_site and metrics.stack_players >= 4:
+        label = _zone_label(map_key, metrics.stack_site)
+        lines.append(
+            f"— Любят stack {label} ({metrics.stack_players} игрока) "
+            "после проигранного раунда"
+        )
+
+    if metrics.default_tendency >= 0.55:
+        lines.append("— Слабый default: долго раскачиваются, мало информации")
+    elif metrics.entry_rate < 0.13 and metrics.utility_per_round < 0.24:
+        lines.append("— Пассивная защита: мало ранних выходов и инфо-утилити")
+
+    if metrics.defuses_per_round >= 0.08:
+        zone = _dominant_attack_zone(metrics)
+        label = _zone_label(map_key, zone)
+        lines.append(f"— Часто играют от retake на {label}")
+
+    return lines
+
+
+def generate_t_playstyle_lines(
+    metrics: AggregatedPlaystyleMetrics, map_key: str
+) -> list[str]:
+    lines: list[str] = []
+    attack_zone = _dominant_attack_zone(metrics)
+    label = _zone_label(map_key, attack_zone)
+
+    if metrics.fast_round_pct >= 40 or metrics.avg_round_seconds <= 38:
+        lines.append(
+            f"— Быстрые выходы на {label} "
+            f"(среднее время раунда: {metrics.avg_round_seconds:.0f} сек)"
+        )
+
+    if metrics.split_tendency < 0.38:
+        lines.append("— Мало split'ов: редко делят точки")
+
+    if (
+        metrics.pistol_kills_per_round >= 0.10
+        and attack_zone == "B"
+        and metrics.fast_round_pct >= 35
+    ):
+        lines.append(f"— После эко любят rush {label} с P90")
+    elif metrics.execute_tendency >= 0.52:
+        lines.append(
+            f"— Execute-стиль на {label}: "
+            f"{'мало дефолта' if metrics.default_tendency >= 0.45 else 'быстрые тактики'}"
+        )
+    elif metrics.default_tendency >= 0.55:
+        lines.append("— Часто играют от дефолта, execute включают поздно")
+
+    return lines
+
+
+def analyze_team_playstyle(
+    service: FaceitService,
+    opponent_player_ids: list[str],
+    players: list[AnalyzedPlayer],
+    map_key: str,
+) -> TeamPlaystyleAnalysis | None:
+    bundles = collect_opponent_map_match_bundles(
+        service, opponent_player_ids, map_key
+    )
+    if len(bundles) < MIN_SIDE_STYLE_MATCHES:
+        return None
+
+    metrics = aggregate_playstyle_metrics(bundles, players, map_key)
+    if metrics is None:
+        return None
+
+    map_display_name = format_map_name(map_key)
+    ct_lines = generate_ct_playstyle_lines(metrics, map_key)
+    t_lines = generate_t_playstyle_lines(metrics, map_key)
+
+    if not ct_lines and not t_lines:
+        return None
+
+    return TeamPlaystyleAnalysis(
+        map_display_name=map_display_name,
+        ct=SidePlaystyle("CT", ct_lines) if ct_lines else None,
+        t=SidePlaystyle("T", t_lines) if t_lines else None,
+    )
+
+
+def format_playstyle_analysis(analysis: TeamPlaystyleAnalysis) -> list[str]:
+    lines: list[str] = []
+
+    if analysis.ct and analysis.ct.lines:
+        lines.extend(
+            [f"🧠 КАК ОНИ ИГРАЮТ ЗА CT (на {analysis.map_display_name}):"]
+            + analysis.ct.lines
+            + [""]
+        )
+
+    if analysis.t and analysis.t.lines:
+        lines.extend(
+            [f"🧠 КАК ОНИ ИГРАЮТ ЗА T (на {analysis.map_display_name}):"]
+            + analysis.t.lines
+        )
+
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 def pick_attack_advice(
     players: list[AnalyzedPlayer], team_avg: MapSkill
-) -> tuple[str, list[str]]:
-    """Точка для атаки и ники слабых игроков на ней."""
+) -> tuple[str, AnalyzedPlayer]:
+    """Точка для атаки и слабый якорь на ней."""
     by_site: dict[str, list[AnalyzedPlayer]] = {}
     for player in players:
         by_site.setdefault(player.site, []).append(player)
@@ -771,13 +1329,188 @@ def pick_attack_advice(
     if not weak_players:
         weak_players = [min(by_site[target_site], key=skill_sort_key)]
 
-    return target_site, [p.nickname for p in weak_players]
+    anchor = min(weak_players, key=skill_sort_key)
+    return target_site, anchor
 
 
-def format_map_pool_line(entries: list[MapPoolEntry]) -> str:
-    if not entries:
-        return "—"
-    return ", ".join(f"{e.display_name} ({e.win_rate:.0f}%)" for e in entries)
+def compute_hold_rating(map_stats: dict[str, Any]) -> float | None:
+    """Рейтинг удержания позиции (0–1) по статистике защиты на карте."""
+    components: list[tuple[float, float]] = []
+
+    v2 = _parse_optional_stat(map_stats, STAT_1V2_WIN_KEYS)
+    if v2 is not None:
+        components.append((v2, 0.40))
+
+    v1 = _parse_optional_stat(map_stats, STAT_1V1_WIN_KEYS)
+    if v1 is not None:
+        components.append((v1, 0.25))
+
+    entry_rate = _parse_optional_stat(map_stats, STAT_ENTRY_RATE_KEYS)
+    if entry_rate is not None:
+        anchor_factor = 1.0 - min(entry_rate * 2.0, 1.0)
+        components.append((anchor_factor, 0.20))
+
+    kd = _parse_optional_stat(map_stats, STAT_KD_KEYS)
+    if kd is not None:
+        components.append((min(kd / 1.5, 1.0), 0.15))
+
+    if not components:
+        return None
+
+    total_weight = sum(weight for _, weight in components)
+    rating = sum(value * weight for value, weight in components) / total_weight
+    return round(rating, 2)
+
+
+def parse_success_defend(map_stats: dict[str, Any]) -> float | None:
+    """Процент успешных защит (Win Rate % на карте из cs2 stats)."""
+    win_rate = _parse_optional_stat(map_stats, STAT_WIN_RATE_KEYS)
+    if win_rate is None:
+        return None
+    return round(_as_percent(win_rate), 0)
+
+
+def compute_first_death_percent(
+    map_stats: dict[str, Any], recent_matches: list[dict[str, Any]]
+) -> float | None:
+    """Как часто игрок умирает первым в раунде (opening deaths)."""
+    direct = _first_present(map_stats, STAT_FIRST_DEATH_KEYS)
+    if direct is not None:
+        return round(_as_percent(_parse_float(direct)), 0)
+
+    total_rounds = 0.0
+    opening_deaths = 0.0
+    for pstats in recent_matches:
+        rounds = _parse_optional_stat(pstats, STAT_MATCH_ROUNDS_KEYS)
+        if not rounds or rounds <= 0:
+            continue
+        entry = _parse_optional_stat(pstats, STAT_TOTAL_ENTRY_COUNT_KEYS) or 0.0
+        entry_wins = _parse_optional_stat(pstats, STAT_TOTAL_ENTRY_WINS_KEYS) or 0.0
+        first_kills = _parse_optional_stat(pstats, STAT_MATCH_FIRST_KILLS_KEYS) or 0.0
+        deaths = _parse_optional_stat(pstats, STAT_MATCH_DEATHS_KEYS) or 0.0
+
+        failed_entry = max(0.0, entry - entry_wins)
+        passive_opening = max(0.0, deaths - first_kills - entry_wins) * 0.35
+        total_rounds += rounds
+        opening_deaths += failed_entry + passive_opening
+
+    if total_rounds >= 5:
+        return round(min(100.0, opening_deaths / total_rounds * 100), 0)
+
+    ext_rounds = _parse_optional_stat(map_stats, STAT_TOTAL_ROUNDS_EXT_KEYS)
+    entry_count = _parse_optional_stat(map_stats, STAT_TOTAL_ENTRY_COUNT_KEYS)
+    entry_wins = _parse_optional_stat(map_stats, STAT_TOTAL_ENTRY_WINS_KEYS)
+    if ext_rounds and ext_rounds > 0 and entry_count is not None and entry_wins is not None:
+        rate = max(0.0, entry_count - entry_wins) / ext_rounds
+        deaths = _parse_optional_stat(map_stats, STAT_MATCH_DEATHS_KEYS) or 0.0
+        rounds = _parse_optional_stat(map_stats, STAT_MATCH_ROUNDS_KEYS) or ext_rounds
+        if rounds > 0:
+            rate = min(1.0, rate + max(0.0, deaths / rounds - rate) * 0.35)
+        return round(rate * 100, 0)
+
+    return None
+
+
+def compute_flash_vulnerability(map_stats: dict[str, Any]) -> float | None:
+    """Доля смертей после ослепления (если есть в данных API)."""
+    direct = _first_present(map_stats, STAT_FLASH_VULN_KEYS)
+    if direct is not None:
+        return round(_as_percent(_parse_float(direct)), 0)
+
+    entry_success = _parse_optional_stat(map_stats, STAT_ENTRY_SUCCESS_KEYS)
+    v2_win = _parse_optional_stat(map_stats, STAT_1V2_WIN_KEYS)
+    if entry_success is not None and v2_win is not None:
+        vuln = (1.0 - entry_success) * (1.0 - v2_win) * 100
+        return round(min(100.0, max(0.0, vuln)), 0)
+
+    return None
+
+
+def get_player_defense_stats(
+    service: FaceitService,
+    player_id: str,
+    map_key: str,
+) -> AnchorDefenseStats:
+    try:
+        cs2_stats = service.get_player_cs2_stats(player_id)
+    except (FaceitNotFoundError, FaceitAPIError):
+        return AnchorDefenseStats(None, None, None, None)
+
+    map_stats = get_map_segment_stats(cs2_stats, map_key)
+    if not map_stats:
+        return AnchorDefenseStats(None, None, None, None)
+
+    recent = collect_recent_map_match_stats(service, player_id, map_key)
+    return AnchorDefenseStats(
+        hold_rating=compute_hold_rating(map_stats),
+        success_defend=parse_success_defend(map_stats),
+        first_death_percent=compute_first_death_percent(map_stats, recent),
+        flash_vulnerability=compute_flash_vulnerability(map_stats),
+    )
+
+
+def generate_attack_verdict(stats: AnchorDefenseStats) -> str:
+    weak_hold = stats.hold_rating is not None and stats.hold_rating < 0.55
+    low_defend = stats.success_defend is not None and stats.success_defend < 45
+    high_flash = stats.flash_vulnerability is not None and stats.flash_vulnerability >= 50
+    high_first_death = (
+        stats.first_death_percent is not None and stats.first_death_percent >= 30
+    )
+
+    if (weak_hold or low_defend) and high_flash:
+        return "слабый якорь, заходит с флешками."
+    if (weak_hold or low_defend) and high_first_death:
+        return "слабый якорь, давите быстрым пиком."
+    if weak_hold or low_defend:
+        return "слабый якорь, можно давить числом."
+    if high_first_death:
+        return "часто умирает первым — пробуйте дефолт и трейдите."
+    if high_flash:
+        return "уязвим к флешкам — выжигайте перед заходом."
+    return "самое слабое звено на точке."
+
+
+def build_attack_advice(
+    players: list[AnalyzedPlayer], team_avg: MapSkill
+) -> AttackAdvice | None:
+    if not players:
+        return None
+
+    target_site, anchor = pick_attack_advice(players, team_avg)
+    stats = anchor.defense or AnchorDefenseStats(None, None, None, None)
+    return AttackAdvice(
+        site=target_site,
+        anchor=anchor,
+        stats=stats,
+        verdict=generate_attack_verdict(stats),
+    )
+
+
+def format_attack_advice(advice: AttackAdvice) -> list[str]:
+    stats = advice.stats
+    lines = [f"🎯 ДАВИТЕ ТОЧКУ {advice.site}:"]
+
+    hold_suffix = (
+        f" (hold rating: {stats.hold_rating:.2f})"
+        if stats.hold_rating is not None
+        else ""
+    )
+    lines.append(f"— Anchor: {advice.anchor.nickname}{hold_suffix}")
+
+    if stats.success_defend is not None:
+        lines.append(f"— Успешных защит: {stats.success_defend:.0f}%")
+
+    if stats.first_death_percent is not None:
+        lines.append(f"— Умирает первым: в {stats.first_death_percent:.0f}% раундов")
+
+    if stats.flash_vulnerability is not None:
+        lines.append(
+            f"— Боится флешек: {stats.flash_vulnerability:.0f}% "
+            "смертей после ослепления"
+        )
+
+    lines.append(f"— Вердикт: {advice.verdict}")
+    return lines
 
 
 def analyze_opponents(
@@ -789,6 +1522,8 @@ def analyze_opponents(
     map_key = resolve_match_map(service, match_id, match)
     map_name = format_map_name(map_key)
     roster = get_opponent_roster(match, user_nickname)
+    user_member = get_user_from_match(match, user_nickname)
+    user_player_id = (user_member or {}).get("player_id") if user_member else None
 
     analyzed: list[AnalyzedPlayer] = []
     player_ids: list[str] = []
@@ -802,6 +1537,7 @@ def analyze_opponents(
         try:
             skill = get_player_map_skill(service, player_id, map_key)
             site, site_source = detect_player_site(service, member, map_key, index)
+            defense = get_player_defense_stats(service, player_id, map_key)
         except (FaceitNotFoundError, FaceitAPIError, ValueError) as exc:
             logger.warning("Пропуск игрока %s: %s", nickname, exc)
             continue
@@ -812,6 +1548,7 @@ def analyze_opponents(
                 skill=skill,
                 site=site,
                 site_source=site_source,
+                defense=defense,
             )
         )
 
@@ -825,7 +1562,13 @@ def analyze_opponents(
     weakest = analyzed[0]
     strongest = analyzed[-1]
     team_avg = average_team_skill(analyzed)
-    map_pool = analyze_opponent_map_pool(service, player_ids)
+    map_pool = (
+        analyze_map_pool(service, player_ids, user_player_id)
+        if user_player_id
+        else None
+    )
+    attack_advice = build_attack_advice(analyzed, team_avg)
+    playstyle = analyze_team_playstyle(service, player_ids, analyzed, map_key)
 
     return AnalysisResult(
         map_name=map_name,
@@ -835,6 +1578,8 @@ def analyze_opponents(
         weakest=weakest,
         strongest=strongest,
         map_pool=map_pool,
+        attack_advice=attack_advice,
+        playstyle=playstyle,
     )
 
 
@@ -857,34 +1602,14 @@ def build_report(result: AnalysisResult) -> str:
             f"(K/D: {skill.kd_ratio:.2f}, ADR: {skill.adr:.0f}, HS%: {skill.hs_pct:.0f}%)"
         )
 
-    attack_site, weak_names = pick_attack_advice(result.players, result.team_avg)
-    lines.extend(
-        [
-            "",
-            f"🎯 Совет: Атакуй точку {attack_site} (слабые: {', '.join(weak_names)})",
-        ]
-    )
+    if result.attack_advice:
+        lines.extend([""] + format_attack_advice(result.attack_advice))
 
-    if result.map_pool and result.map_pool.entries:
-        worst = result.map_pool.worst
-        best = result.map_pool.best
-        lines.extend(
-            [
-                "",
-                f"📉 Худшие карты соперника: {format_map_pool_line(worst)}",
-                f"📈 Лучшие карты: {format_map_pool_line(best)}",
-                f"⚠️ Баньте: {', '.join(e.display_name for e in worst) or '—'}",
-                f"✅ Оставляйте: {', '.join(e.display_name for e in best) or '—'}",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "",
-                "📉 Худшие карты соперника: недостаточно данных",
-                "📈 Лучшие карты: недостаточно данных",
-            ]
-        )
+    if result.playstyle and (result.playstyle.ct or result.playstyle.t):
+        lines.extend([""] + format_playstyle_analysis(result.playstyle))
+
+    if result.map_pool and result.map_pool.recommendations:
+        lines.extend(format_map_recommendations(result.map_pool))
 
     return "\n".join(lines)
 
