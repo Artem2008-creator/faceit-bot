@@ -74,122 +74,210 @@ MAP_DISPLAY_NAMES: dict[str, str] = {
     "de_train": "Train",
 }
 
-# Роль в матче → типичная точка на карте (CT-удержание)
-ROLE_SITE_BY_MAP: dict[str, dict[str, str]] = {
+# Карты без позиций — только общая статистика
+MAPS_WITHOUT_POSITIONS = frozenset({"de_overpass", "de_dust2"})
+
+# Допустимые позиции на карте (CS2 callouts)
+MAP_VALID_POSITIONS: dict[str, tuple[str, ...]] = {
+    "de_mirage": ("A anchor", "B anchor", "Short", "Connector", "Window"),
+    "de_inferno": ("A anchor", "B anchor", "Pit/Balcony", "Apps"),
+    "de_ancient": ("A anchor", "B anchor", "Cave", "Mid"),
+    "de_nuke": ("A anchor", "Outside", "Ramp", "Rotation", "Main"),
+    "de_anubis": ("A anchor", "B anchor", "Mid", "Connector"),
+    "de_cache": ("A anchor", "Short", "Mid", "B anchor"),
+}
+
+# Синонимы из Faceit API (roles / heatmap keys) → каноническое имя
+POSITION_ALIASES: dict[str, dict[str, str]] = {
     "de_mirage": {
-        "anchor": "B",
-        "support": "B",
-        "entry": "A",
-        "lurker": "A",
-        "igl": "Mid",
-        "awper": "Mid",
-        "awp": "Mid",
-        "rifler": "Mid",
-    },
-    "de_dust2": {
-        "anchor": "B",
-        "support": "B",
-        "entry": "B",
-        "lurker": "A",
-        "igl": "Mid",
-        "awper": "A",
-        "awp": "A",
-        "rifler": "Mid",
+        "a": "A anchor",
+        "a anchor": "A anchor",
+        "a site": "A anchor",
+        "b": "B anchor",
+        "b anchor": "B anchor",
+        "b site": "B anchor",
+        "short": "Short",
+        "connector": "Connector",
+        "con": "Connector",
+        "window": "Window",
+        "win": "Window",
     },
     "de_inferno": {
-        "anchor": "B",
-        "support": "B",
-        "entry": "A",
-        "lurker": "Mid",
-        "igl": "Mid",
-        "awper": "A",
-        "awp": "A",
-        "rifler": "Mid",
-    },
-    "de_nuke": {
-        "anchor": "B",
-        "support": "B",
-        "entry": "A",
-        "lurker": "Mid",
-        "igl": "Mid",
-        "awper": "A",
-        "awp": "A",
-        "rifler": "Mid",
-    },
-    "de_overpass": {
-        "anchor": "B",
-        "support": "B",
-        "entry": "A",
-        "lurker": "B",
-        "igl": "Mid",
-        "awper": "A",
-        "awp": "A",
-        "rifler": "Mid",
+        "a": "A anchor",
+        "a anchor": "A anchor",
+        "b": "B anchor",
+        "b anchor": "B anchor",
+        "pit": "Pit/Balcony",
+        "balcony": "Pit/Balcony",
+        "pit balcony": "Pit/Balcony",
+        "pit/balcony": "Pit/Balcony",
+        "apps": "Apps",
+        "apartments": "Apps",
+        "app": "Apps",
     },
     "de_ancient": {
-        "anchor": "B",
-        "support": "B",
-        "entry": "A",
-        "lurker": "B",
-        "igl": "Mid",
-        "awper": "Mid",
-        "awp": "Mid",
-        "rifler": "Mid",
+        "a": "A anchor",
+        "a anchor": "A anchor",
+        "b": "B anchor",
+        "b anchor": "B anchor",
+        "cave": "Cave",
+        "mid": "Mid",
+        "middle": "Mid",
+    },
+    "de_nuke": {
+        "a": "A anchor",
+        "a anchor": "A anchor",
+        "a site": "A anchor",
+        "outside": "Outside",
+        "yard": "Outside",
+        "ramp": "Ramp",
+        "rotation": "Rotation",
+        "rot": "Rotation",
+        "haven": "Rotation",
+        "main": "Main",
+        "main hall": "Main",
     },
     "de_anubis": {
-        "anchor": "B",
-        "support": "B",
-        "entry": "A",
-        "lurker": "B",
-        "igl": "Mid",
-        "awper": "Mid",
-        "awp": "Mid",
-        "rifler": "Mid",
-    },
-    "de_vertigo": {
-        "anchor": "B",
-        "support": "B",
-        "entry": "A",
-        "lurker": "A",
-        "igl": "Mid",
-        "awper": "A",
-        "awp": "A",
-        "rifler": "Mid",
+        "a": "A anchor",
+        "a anchor": "A anchor",
+        "b": "B anchor",
+        "b anchor": "B anchor",
+        "mid": "Mid",
+        "middle": "Mid",
+        "connector": "Connector",
+        "con": "Connector",
     },
     "de_cache": {
-        "anchor": "B",
-        "support": "B",
-        "entry": "A",
-        "lurker": "Mid",
-        "igl": "Mid",
-        "awper": "Mid",
-        "awp": "Mid",
-        "rifler": "Mid",
-    },
-    "de_train": {
-        "anchor": "B",
-        "support": "B",
-        "entry": "A",
-        "lurker": "B",
-        "igl": "Mid",
-        "awper": "A",
-        "awp": "A",
-        "rifler": "Mid",
+        "a": "A anchor",
+        "a anchor": "A anchor",
+        "short": "Short",
+        "mid": "Mid",
+        "middle": "Mid",
+        "b": "B anchor",
+        "b anchor": "B anchor",
     },
 }
 
-DEFAULT_ROLE_SITE = {
-    "anchor": "B",
-    "support": "B",
-    "entry": "A",
-    "lurker": "A",
-    "igl": "Mid",
-    "awper": "Mid",
-    "awp": "Mid",
-    "rifler": "Mid",
+# Тактическая роль Faceit → возможные позиции (выбор только при наличии heatmap)
+TACTICAL_ROLE_CANDIDATES: dict[str, dict[str, tuple[str, ...]]] = {
+    "de_mirage": {
+        "anchor": ("A anchor", "B anchor"),
+        "support": ("B anchor", "Connector", "Window"),
+        "entry": ("Short", "A anchor", "Connector"),
+        "lurker": ("Connector", "Short", "Window"),
+        "awper": ("Window", "A anchor", "Connector"),
+        "awp": ("Window", "A anchor", "Connector"),
+        "rifler": ("Connector", "Short", "A anchor"),
+        "igl": ("Connector", "Window"),
+    },
+    "de_inferno": {
+        "anchor": ("A anchor", "B anchor"),
+        "support": ("B anchor", "Apps", "Pit/Balcony"),
+        "entry": ("Apps", "A anchor"),
+        "lurker": ("Apps", "Pit/Balcony"),
+        "awper": ("A anchor", "Pit/Balcony"),
+        "awp": ("A anchor", "Pit/Balcony"),
+        "rifler": ("Apps", "A anchor", "B anchor"),
+        "igl": ("Apps", "A anchor"),
+    },
+    "de_ancient": {
+        "anchor": ("A anchor", "B anchor"),
+        "support": ("B anchor", "Cave", "Mid"),
+        "entry": ("A anchor", "Cave"),
+        "lurker": ("Cave", "Mid"),
+        "awper": ("Mid", "A anchor"),
+        "awp": ("Mid", "A anchor"),
+        "rifler": ("Mid", "Cave"),
+        "igl": ("Mid",),
+    },
+    "de_nuke": {
+        "anchor": ("A anchor", "Ramp", "Main"),
+        "support": ("Outside", "Ramp", "Rotation"),
+        "entry": ("Outside", "Ramp"),
+        "lurker": ("Outside", "Rotation"),
+        "awper": ("Outside", "A anchor"),
+        "awp": ("Outside", "A anchor"),
+        "rifler": ("Outside", "Ramp", "Main"),
+        "igl": ("Outside", "Rotation"),
+    },
+    "de_anubis": {
+        "anchor": ("A anchor", "B anchor"),
+        "support": ("B anchor", "Connector", "Mid"),
+        "entry": ("A anchor", "Mid"),
+        "lurker": ("Connector", "Mid"),
+        "awper": ("Mid", "A anchor"),
+        "awp": ("Mid", "A anchor"),
+        "rifler": ("Mid", "Connector"),
+        "igl": ("Mid", "Connector"),
+    },
+    "de_cache": {
+        "anchor": ("A anchor", "B anchor"),
+        "support": ("B anchor", "Mid"),
+        "entry": ("Short", "A anchor"),
+        "lurker": ("Short", "Mid"),
+        "awper": ("Mid", "A anchor"),
+        "awp": ("Mid", "A anchor"),
+        "rifler": ("Mid", "Short"),
+        "igl": ("Mid",),
+    },
 }
 
-FALLBACK_SITES = ("B", "A", "Mid", "B", "A")
+# Позиция → зона для атаки / паттернов (A, B, MID)
+POSITION_ATTACK_SITE: dict[str, dict[str, str]] = {
+    "de_mirage": {
+        "A anchor": "A",
+        "Short": "A",
+        "Connector": "A",
+        "Window": "MID",
+        "B anchor": "B",
+    },
+    "de_inferno": {
+        "A anchor": "A",
+        "Pit/Balcony": "A",
+        "Apps": "B",
+        "B anchor": "B",
+    },
+    "de_ancient": {
+        "A anchor": "A",
+        "Cave": "B",
+        "B anchor": "B",
+        "Mid": "MID",
+    },
+    "de_nuke": {
+        "A anchor": "A",
+        "Outside": "A",
+        "Ramp": "B",
+        "Rotation": "B",
+        "Main": "B",
+    },
+    "de_anubis": {
+        "A anchor": "A",
+        "B anchor": "B",
+        "Mid": "MID",
+        "Connector": "MID",
+    },
+    "de_cache": {
+        "A anchor": "A",
+        "Short": "A",
+        "Mid": "MID",
+        "B anchor": "B",
+    },
+}
+
+HEATMAP_STAT_HINTS = ("%", "kill", "time", "round", "damage", "death", "activity")
+HEATMAP_CONTAINER_KEYS = (
+    "heatmap",
+    "Heatmap",
+    "position_heatmap",
+    "Position Heatmap",
+    "zones",
+    "Zones",
+    "position",
+    "Position",
+)
+MEMBER_ROLE_KEYS = ("roles", "role", "game_roles", "positions")
+MEMBER_HEATMAP_KEYS = HEATMAP_CONTAINER_KEYS
+MIN_HEATMAP_CONFIDENCE_RATIO = 1.25
 
 STAT_KD_KEYS = ("Average K/D Ratio", "K/D Ratio", "Average K/D", "kd_ratio")
 STAT_KILLS_KEYS = ("Kills",)
@@ -219,6 +307,11 @@ STAT_FLASH_VULN_KEYS = (
 STAT_MATCH_ROUNDS_KEYS = ("Rounds",)
 STAT_MATCH_DEATHS_KEYS = ("Deaths",)
 STAT_MATCH_FIRST_KILLS_KEYS = ("First Kills",)
+STAT_HS_MATCH_KEYS = ("Headshots %", "Average Headshots %", "Headshot %", "HS %")
+STAT_1V1_WINS_KEYS = ("1v1Wins", "1v1 Wins")
+STAT_1V1_COUNT_KEYS = ("1v1Count", "1v1 Count")
+STAT_1V2_WINS_KEYS = ("1v2Wins", "1v2 Wins")
+STAT_1V2_COUNT_KEYS = ("1v2Count", "1v2 Count")
 STAT_MATCH_ASSISTS_KEYS = ("Assists",)
 STAT_SNIPER_KILLS_KEYS = ("Sniper Kills",)
 STAT_MAP_MATCHES_KEYS = ("Total Matches", "Matches", "Total matches")
@@ -230,16 +323,16 @@ STAT_FLASHES_PER_ROUND_KEYS = ("Flashes per Round in a Match", "Flashes per Roun
 
 # Человекочитаемые названия зон для паттернов CT/T
 MAP_ZONE_LABELS: dict[str, dict[str, str]] = {
-    "de_mirage": {"A": "A", "B": "banana", "Mid": "mid"},
-    "de_dust2": {"A": "Long/A", "B": "B", "Mid": "mid"},
-    "de_inferno": {"A": "A", "B": "banana", "Mid": "mid"},
-    "de_nuke": {"A": "A/yard", "B": "B/ramp", "Mid": "mid"},
-    "de_overpass": {"A": "A", "B": "B", "Mid": "mid"},
-    "de_ancient": {"A": "A", "B": "B", "Mid": "mid"},
-    "de_anubis": {"A": "A", "B": "B", "Mid": "mid"},
-    "de_vertigo": {"A": "A", "B": "B", "Mid": "mid"},
-    "de_cache": {"A": "A", "B": "B", "Mid": "mid"},
-    "de_train": {"A": "A", "B": "B", "Mid": "mid"},
+    "de_mirage": {"A": "A", "B": "banana", "MID": "mid"},
+    "de_dust2": {"A": "Long/A", "B": "B", "MID": "mid"},
+    "de_inferno": {"A": "A", "B": "banana", "MID": "mid"},
+    "de_nuke": {"A": "yard/outside", "B": "ramp/main", "MID": "mid"},
+    "de_overpass": {"A": "A", "B": "B", "MID": "mid"},
+    "de_ancient": {"A": "A", "B": "B", "MID": "mid"},
+    "de_anubis": {"A": "A", "B": "B", "MID": "mid"},
+    "de_vertigo": {"A": "A", "B": "B", "MID": "mid"},
+    "de_cache": {"A": "A", "B": "B", "MID": "mid"},
+    "de_train": {"A": "A", "B": "B", "MID": "mid"},
 }
 
 logging.basicConfig(
@@ -801,17 +894,237 @@ def get_player_map_skill(service: FaceitService, player_id: str, map_key: str) -
     return skill
 
 
-def role_to_site(roles: list[str] | None, map_key: str) -> str | None:
-    if not roles:
+def _normalize_position_token(text: str) -> str:
+    return re.sub(r"[\s_/\-]+", " ", str(text).strip().lower())
+
+
+def _canonical_position(map_key: str, raw: str) -> str | None:
+    positions = MAP_VALID_POSITIONS.get(map_key)
+    if not positions or not raw:
         return None
-    mapping = ROLE_SITE_BY_MAP.get(map_key, DEFAULT_ROLE_SITE)
-    for role in roles:
-        if not isinstance(role, str):
-            continue
-        site = mapping.get(role.strip().lower())
-        if site:
-            return site
+
+    token = _normalize_position_token(raw)
+    by_lower = {position.lower(): position for position in positions}
+    if token in by_lower:
+        return by_lower[token]
+
+    alias = POSITION_ALIASES.get(map_key, {}).get(token)
+    if alias:
+        return alias
+
+    for alias_key, position in POSITION_ALIASES.get(map_key, {}).items():
+        if alias_key in token or token in alias_key:
+            return position
+
     return None
+
+
+def _extract_member_roles(member: dict[str, Any]) -> list[str]:
+    collected: list[str] = []
+    for key in MEMBER_ROLE_KEYS:
+        raw = member.get(key)
+        if isinstance(raw, str) and raw.strip():
+            collected.append(raw.strip())
+        elif isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str) and item.strip():
+                    collected.append(item.strip())
+    return collected
+
+
+def _resolve_nuke_rotation_main(
+    heatmap_scores: dict[str, float], stats: dict[str, Any]
+) -> str | None:
+    rotation = heatmap_scores.get("Rotation", 0.0)
+    main = heatmap_scores.get("Main", 0.0)
+    if rotation <= 0 and main <= 0:
+        return None
+
+    haven_signal = 0.0
+    main_signal = 0.0
+    for key, value in stats.items():
+        key_l = str(key).lower()
+        try:
+            num = _parse_float(value)
+        except (TypeError, ValueError):
+            continue
+        if "haven" in key_l:
+            haven_signal += num
+        if key_l == "main" or " main " in f" {key_l} ":
+            main_signal += num
+
+    if haven_signal > main_signal * 1.1:
+        return "Rotation"
+    if main_signal > haven_signal * 1.1:
+        return "Main"
+    return "Rotation" if rotation >= main else "Main"
+
+
+def extract_heatmap_scores(stats: dict[str, Any], map_key: str) -> dict[str, float]:
+    """Зоны из heatmap/position полей Faceit API (сегменты и матч-статы)."""
+    if map_key not in MAP_VALID_POSITIONS or not stats:
+        return {}
+
+    scores: dict[str, float] = {}
+    aliases = POSITION_ALIASES.get(map_key, {})
+
+    def add_score(position: str, value: Any) -> None:
+        try:
+            amount = _parse_float(value)
+        except (TypeError, ValueError):
+            return
+        if amount <= 0:
+            return
+        scores[position] = scores.get(position, 0.0) + amount
+
+    def absorb_mapping(mapping: dict[str, Any]) -> None:
+        for key, value in mapping.items():
+            position = _canonical_position(map_key, str(key))
+            if position:
+                add_score(position, value)
+            elif isinstance(value, dict):
+                absorb_mapping(value)
+
+    for container_key in HEATMAP_CONTAINER_KEYS:
+        raw = stats.get(container_key)
+        if isinstance(raw, dict):
+            absorb_mapping(raw)
+
+    for key, value in stats.items():
+        if value is None:
+            continue
+        key_l = str(key).lower()
+        position = _canonical_position(map_key, str(key))
+        if not position:
+            continue
+        if any(hint in key_l for hint in HEATMAP_STAT_HINTS) or "heat" in key_l:
+            add_score(position, value)
+            continue
+        for alias in aliases:
+            if alias in key_l and any(hint in key_l for hint in HEATMAP_STAT_HINTS):
+                add_score(position, value)
+                break
+
+    if map_key == "de_nuke" and ("Rotation" in scores or "Main" in scores):
+        resolved = _resolve_nuke_rotation_main(scores, stats)
+        if resolved:
+            combined = scores.get("Rotation", 0.0) + scores.get("Main", 0.0)
+            if combined > 0:
+                scores[resolved] = combined
+
+    return scores
+
+
+def _heatmap_winner(heatmap_scores: dict[str, float]) -> str | None:
+    if not heatmap_scores:
+        return None
+    ranked = sorted(heatmap_scores.items(), key=lambda item: item[1], reverse=True)
+    best_position, best_value = ranked[0]
+    if best_value <= 0:
+        return None
+    if len(ranked) == 1:
+        return best_position
+    second_value = ranked[1][1]
+    if second_value <= 0 or best_value >= second_value * MIN_HEATMAP_CONFIDENCE_RATIO:
+        return best_position
+    return None
+
+
+def _pick_role_candidates_with_heatmap(
+    roles: list[str], map_key: str, heatmap_scores: dict[str, float]
+) -> str | None:
+    role_map = TACTICAL_ROLE_CANDIDATES.get(map_key, {})
+    for role in roles:
+        candidates = role_map.get(_normalize_position_token(role))
+        if not candidates:
+            continue
+        if len(candidates) == 1:
+            only = candidates[0]
+            if not heatmap_scores:
+                continue
+            if heatmap_scores.get(only, 0.0) > 0:
+                return only
+            continue
+        filtered = {
+            position: heatmap_scores[position]
+            for position in candidates
+            if heatmap_scores.get(position, 0.0) > 0
+        }
+        if not filtered:
+            continue
+        return max(filtered, key=filtered.get)
+    return None
+
+
+def collect_faceit_heatmap_scores(
+    service: FaceitService, player_id: str, map_key: str
+) -> dict[str, float]:
+    combined: dict[str, float] = {}
+
+    def merge(scores: dict[str, float]) -> None:
+        for position, value in scores.items():
+            combined[position] = combined.get(position, 0.0) + value
+
+    if player_id:
+        try:
+            cs2_stats = service.get_player_cs2_stats(player_id)
+            merge(extract_heatmap_scores(get_map_segment_stats(cs2_stats, map_key), map_key))
+            for segment in cs2_stats.get("segments") or []:
+                if normalize_map_key(segment.get("label")) != map_key:
+                    continue
+                seg_type = (segment.get("type") or "").lower()
+                if seg_type in ("heatmap", "position", "zone", "map"):
+                    merge(
+                        extract_heatmap_scores(segment.get("stats") or {}, map_key)
+                    )
+        except (FaceitNotFoundError, FaceitAPIError):
+            pass
+
+        for pstats in collect_recent_map_match_stats(service, player_id, map_key):
+            merge(extract_heatmap_scores(pstats, map_key))
+
+    return combined
+
+
+def position_attack_site(map_key: str, position: str) -> str:
+    if not position or position == "?":
+        return ""
+    return POSITION_ATTACK_SITE.get(map_key, {}).get(position, "")
+
+
+def detect_player_position(
+    service: FaceitService,
+    member: dict[str, Any],
+    map_key: str,
+) -> tuple[str, str]:
+    """Позиция только из Faceit API (roles, heatmap). Dust2/Overpass — без позиций."""
+    if map_key in MAPS_WITHOUT_POSITIONS:
+        return "", ""
+
+    player_id = member.get("player_id") or ""
+    roles = _extract_member_roles(member)
+
+    for role in roles:
+        direct = _canonical_position(map_key, role)
+        if direct:
+            return direct, "роль"
+
+    heatmap_scores = collect_faceit_heatmap_scores(service, player_id, map_key)
+    for key in MEMBER_HEATMAP_KEYS:
+        raw = member.get(key)
+        if isinstance(raw, dict):
+            for position, value in extract_heatmap_scores(raw, map_key).items():
+                heatmap_scores[position] = heatmap_scores.get(position, 0.0) + value
+
+    heatmap_position = _heatmap_winner(heatmap_scores)
+    if heatmap_position:
+        return heatmap_position, "heatmap"
+
+    role_pick = _pick_role_candidates_with_heatmap(roles, map_key, heatmap_scores)
+    if role_pick:
+        return role_pick, "роль+heatmap"
+
+    return "?", ""
 
 
 def extract_player_match_stats(
@@ -823,68 +1136,6 @@ def extract_player_match_stats(
                 if player.get("player_id") == player_id:
                     return player.get("player_stats") or {}
     return {}
-
-
-def infer_site_from_recent_map_matches(
-    service: FaceitService, player_id: str, map_key: str
-) -> str | None:
-    """
-    Прокси heatmap: по последним матчам на этой карте оцениваем,
-    где игрок чаще «сидит» в защите (plants/defuses → B, entry → A).
-    """
-    per_match = collect_recent_map_match_stats(service, player_id, map_key)
-    if not per_match:
-        return None
-
-    zone_scores = {"A": 0.0, "B": 0.0, "Mid": 0.0}
-    for pstats in per_match:
-        entry = _parse_float(
-            _first_present(
-                pstats,
-                ("Entry Count", "First Kills", "Entry Wins", "Entry Kills"),
-            ),
-            default=0.0,
-        )
-        plants = _parse_float(
-            _first_present(pstats, ("Bomb Plants", "Plants")),
-            default=0.0,
-        )
-        defuses = _parse_float(
-            _first_present(pstats, ("Bomb Defuses", "Defuses")),
-            default=0.0,
-        )
-        damage = _parse_float(
-            _first_present(pstats, ("Damage", "ADR", "Average Damage / Round")),
-            default=0.0,
-        )
-
-        zone_scores["B"] += plants * 3.0 + defuses * 2.5 + damage * 0.005
-        zone_scores["A"] += entry * 4.0
-        zone_scores["Mid"] += damage * 0.01 - entry * 0.5
-
-    return max(zone_scores, key=zone_scores.get)
-
-
-def detect_player_site(
-    service: FaceitService,
-    member: dict[str, Any],
-    map_key: str,
-    roster_index: int,
-) -> tuple[str, str]:
-    roles = member.get("roles")
-    if isinstance(roles, str):
-        roles = [roles]
-    site = role_to_site(roles if isinstance(roles, list) else None, map_key)
-    if site:
-        return site, "роль"
-
-    site = infer_site_from_recent_map_matches(
-        service, member.get("player_id") or "", map_key
-    )
-    if site:
-        return site, "heatmap"
-
-    return FALLBACK_SITES[roster_index % len(FALLBACK_SITES)], "оценка"
 
 
 def skill_sort_key(player: AnalyzedPlayer) -> tuple[float, float]:
@@ -912,13 +1163,25 @@ def player_tier_emoji(
     return "🟡"
 
 
+def format_player_stats_line(
+    nickname: str, position: str, kd: float, avg_kills: float
+) -> str:
+    stats = f"(K/D: {kd:.2f}, AVG: {avg_kills:.0f})"
+    if not position:
+        return f"{nickname} {stats}"
+    if position == "?":
+        return f"{nickname} — ? {stats}"
+    return f"{nickname} — {position} {stats}"
+
+
 def format_main_threat(player: AnalyzedPlayer) -> list[str]:
     skill = player.skill
     return [
         "",
         "⚠️ ГЛАВНАЯ УГРОЗА:",
-        f"{player.nickname} — {player.site} "
-        f"(K/D: {skill.kd_ratio:.2f}, AVG: {skill.avg_kills:.0f})",
+        format_player_stats_line(
+            player.nickname, player.site, skill.kd_ratio, skill.avg_kills
+        ),
     ]
 
 
@@ -1267,8 +1530,13 @@ def aggregate_playstyle_metrics(
     if not bundles:
         return None
 
-    player_sites = {player.player_id: player.site for player in players}
-    site_counts = Counter(player.site for player in players)
+    player_sites = {
+        player.player_id: position_attack_site(map_key, player.site)
+        for player in players
+    }
+    site_counts = Counter(
+        site for site in player_sites.values() if site in ("A", "B", "MID")
+    )
     stack_site, stack_players = None, 0
     for site, count in site_counts.items():
         if count >= 4:
@@ -1282,8 +1550,8 @@ def aggregate_playstyle_metrics(
     total_defuses = 0.0
     total_utility = 0.0
     total_pistol = 0.0
-    zone_pressure = {"A": 0.0, "B": 0.0, "Mid": 0.0}
-    ct_push_by_site = {"A": 0.0, "B": 0.0, "Mid": 0.0}
+    zone_pressure = {"A": 0.0, "B": 0.0, "MID": 0.0}
+    ct_push_by_site = {"A": 0.0, "B": 0.0, "MID": 0.0}
 
     for bundle in bundles:
         rounds = float(bundle["rounds"])
@@ -1292,7 +1560,9 @@ def aggregate_playstyle_metrics(
         total_rounds += rounds
 
         for player_id, stats in bundle["players"]:
-            site = player_sites.get(player_id, "Mid")
+            site = player_sites.get(player_id) or ""
+            if site not in zone_pressure:
+                continue
             entry = _parse_optional_stat(stats, STAT_TOTAL_ENTRY_COUNT_KEYS) or 0.0
             first_kills = _parse_optional_stat(stats, STAT_MATCH_FIRST_KILLS_KEYS) or 0.0
             plants = _parse_optional_stat(stats, STAT_PLANTS_KEYS) or 0.0
@@ -1351,7 +1621,7 @@ def aggregate_playstyle_metrics(
     ct_push_site = max(ct_push_by_site, key=ct_push_by_site.get) if ct_push_by_site else None
     ct_push_pct = min(
         85.0,
-        (ct_push_by_site.get(ct_push_site or "Mid", 0.0) / total_rounds) * 120.0,
+        (ct_push_by_site.get(ct_push_site or "MID", 0.0) / total_rounds) * 120.0,
     )
 
     return AggregatedPlaystyleMetrics(
@@ -1498,12 +1768,23 @@ def format_playstyle_analysis(analysis: TeamPlaystyleAnalysis) -> list[str]:
 
 
 def pick_attack_advice(
-    players: list[AnalyzedPlayer], team_avg: MapSkill
+    players: list[AnalyzedPlayer],
+    team_avg: MapSkill,
+    map_key: str,
 ) -> tuple[str, AnalyzedPlayer]:
     """Точка для атаки и слабый якорь на ней."""
+    if map_key in MAPS_WITHOUT_POSITIONS:
+        return "", min(players, key=skill_sort_key)
+
     by_site: dict[str, list[AnalyzedPlayer]] = {}
     for player in players:
-        by_site.setdefault(player.site, []).append(player)
+        attack_site = position_attack_site(map_key, player.site)
+        if attack_site not in ("A", "B", "MID"):
+            continue
+        by_site.setdefault(attack_site, []).append(player)
+
+    if not by_site:
+        return "", min(players, key=skill_sort_key)
 
     avg_key = (team_avg.kd_ratio, team_avg.avg_kills)
 
@@ -1662,12 +1943,14 @@ def generate_attack_verdict(stats: AnchorDefenseStats) -> str:
 
 
 def build_attack_advice(
-    players: list[AnalyzedPlayer], team_avg: MapSkill
+    players: list[AnalyzedPlayer],
+    team_avg: MapSkill,
+    map_key: str,
 ) -> AttackAdvice | None:
     if not players:
         return None
 
-    target_site, anchor = pick_attack_advice(players, team_avg)
+    target_site, anchor = pick_attack_advice(players, team_avg, map_key)
     stats = anchor.defense or AnchorDefenseStats(None, None, None, None)
     return AttackAdvice(
         site=target_site,
@@ -1679,7 +1962,11 @@ def build_attack_advice(
 
 def format_attack_advice(advice: AttackAdvice) -> list[str]:
     stats = advice.stats
-    lines = [f"🎯 ДАВИТЕ ТОЧКУ {advice.site}:"]
+    if advice.site:
+        header = f"🎯 ДАВИТЕ ТОЧКУ {advice.site}:"
+    else:
+        header = "🎯 СЛАБОЕ ЗВЕНО:"
+    lines = [header]
 
     hold_suffix = (
         f" (hold rating: {stats.hold_rating:.2f})"
@@ -1720,7 +2007,7 @@ def analyze_opponents(
     player_ids: list[str] = []
     player_map_counts: list[int] = []
 
-    for index, member in enumerate(roster):
+    for member in roster:
         player_id = member.get("player_id")
         nickname = member.get("nickname") or "unknown"
         if not player_id:
@@ -1729,7 +2016,7 @@ def analyze_opponents(
         player_map_counts.append(get_player_map_match_count(service, player_id, map_key))
         try:
             skill = get_player_map_skill(service, player_id, map_key)
-            site, site_source = detect_player_site(service, member, map_key, index)
+            site, site_source = detect_player_position(service, member, map_key)
             defense = get_player_defense_stats(service, player_id, map_key)
         except (FaceitNotFoundError, FaceitAPIError, ValueError) as exc:
             logger.warning("Пропуск игрока %s: %s", nickname, exc)
@@ -1760,7 +2047,7 @@ def analyze_opponents(
         if user_player_id
         else None
     )
-    attack_advice = build_attack_advice(analyzed, team_avg)
+    attack_advice = build_attack_advice(analyzed, team_avg, map_key)
     playstyle = analyze_team_playstyle(service, player_ids, analyzed, map_key)
     confidence = compute_confidence_score(player_map_counts)
 
@@ -1792,8 +2079,10 @@ def build_report(result: AnalysisResult) -> str:
         skill = player.skill
         emoji = player_tier_emoji(player, result.weakest, result.strongest)
         lines.append(
-            f"{emoji} {player.nickname} — {player.site} "
-            f"(K/D: {skill.kd_ratio:.2f}, AVG: {skill.avg_kills:.0f})"
+            f"{emoji} "
+            + format_player_stats_line(
+                player.nickname, player.site, skill.kd_ratio, skill.avg_kills
+            )
         )
 
     lines.extend(format_main_threat(result.strongest))
@@ -1820,6 +2109,11 @@ class PeriodStats:
     wins: int
     played: int
     first_kills_avg: float
+    hs_pct: float
+    entry_win_rate: float | None
+    clutch_1vx_win_rate: float | None
+    opening_death_rate: float
+    early_attack_impact: float
 
 
 @dataclass
@@ -1832,7 +2126,7 @@ class ProgressReport:
     elo_delta: int | None
     improved: list[str]
     declined: list[str]
-    growth_zone: str | None
+    growth_zones: list[str]
     requested_count: int
     match_count: int
     partial_note: str | None = None
@@ -1857,6 +2151,13 @@ def _period_stats_from_items(items: list[dict[str, Any]]) -> PeriodStats | None:
     kd_values: list[float] = []
     kills_values: list[float] = []
     first_kills_values: list[float] = []
+    hs_values: list[float] = []
+    opening_death_rates: list[float] = []
+    early_impact_values: list[float] = []
+    entry_wins_total = 0.0
+    entry_count_total = 0.0
+    clutch_wins_total = 0.0
+    clutch_count_total = 0.0
     wins = 0
     played = 0
 
@@ -1867,9 +2168,35 @@ def _period_stats_from_items(items: list[dict[str, Any]]) -> PeriodStats | None:
         if parsed:
             kd_values.append(parsed[0])
             kills_values.append(parsed[1])
-        first_kills = _parse_optional_stat(stats, STAT_MATCH_FIRST_KILLS_KEYS)
-        if first_kills is not None:
-            first_kills_values.append(first_kills)
+
+        first_kills = _parse_optional_stat(stats, STAT_MATCH_FIRST_KILLS_KEYS) or 0.0
+        first_kills_values.append(first_kills)
+
+        hs = _parse_optional_stat(stats, STAT_HS_MATCH_KEYS)
+        if hs is not None:
+            hs_values.append(_as_percent(hs))
+
+        entry = _parse_optional_stat(stats, STAT_TOTAL_ENTRY_COUNT_KEYS) or 0.0
+        entry_wins = _parse_optional_stat(stats, STAT_TOTAL_ENTRY_WINS_KEYS) or 0.0
+        entry_wins_total += entry_wins
+        entry_count_total += entry
+
+        v1_wins = _parse_optional_stat(stats, STAT_1V1_WINS_KEYS) or 0.0
+        v1_count = _parse_optional_stat(stats, STAT_1V1_COUNT_KEYS) or 0.0
+        v2_wins = _parse_optional_stat(stats, STAT_1V2_WINS_KEYS) or 0.0
+        v2_count = _parse_optional_stat(stats, STAT_1V2_COUNT_KEYS) or 0.0
+        clutch_wins_total += v1_wins + v2_wins
+        clutch_count_total += v1_count + v2_count
+
+        deaths = _parse_optional_stat(stats, STAT_MATCH_DEATHS_KEYS) or 0.0
+        rounds = _parse_optional_stat(stats, STAT_MATCH_ROUNDS_KEYS) or 0.0
+        if rounds > 0:
+            failed_entry = max(0.0, entry - entry_wins)
+            passive_opening = max(0.0, deaths - first_kills - entry_wins) * 0.35
+            opening_death_rates.append((failed_entry + passive_opening) / rounds)
+
+        early_impact_values.append(first_kills + entry_wins)
+
         won = parse_match_win(stats)
         if won:
             wins += 1
@@ -1877,17 +2204,30 @@ def _period_stats_from_items(items: list[dict[str, Any]]) -> PeriodStats | None:
     if not kills_values:
         return None
 
+    entry_win_rate: float | None = None
+    if entry_count_total > 0:
+        entry_win_rate = entry_wins_total / entry_count_total
+
+    clutch_1vx_win_rate: float | None = None
+    if clutch_count_total > 0:
+        clutch_1vx_win_rate = clutch_wins_total / clutch_count_total
+
     return PeriodStats(
         kd=sum(kd_values) / len(kd_values),
         avg_kills=sum(kills_values) / len(kills_values),
         win_rate=wins / played * 100 if played else 0.0,
         wins=wins,
         played=played,
-        first_kills_avg=(
-            sum(first_kills_values) / len(first_kills_values)
-            if first_kills_values
+        first_kills_avg=sum(first_kills_values) / len(first_kills_values),
+        hs_pct=sum(hs_values) / len(hs_values) if hs_values else 0.0,
+        entry_win_rate=entry_win_rate,
+        clutch_1vx_win_rate=clutch_1vx_win_rate,
+        opening_death_rate=(
+            sum(opening_death_rates) / len(opening_death_rates)
+            if opening_death_rates
             else 0.0
         ),
+        early_attack_impact=sum(early_impact_values) / len(early_impact_values),
     )
 
 
@@ -1973,63 +2313,129 @@ def _pick_improved_declined(
 def compute_form_score(
     metrics: list[tuple[str, float, float, bool]],
     elo_delta: int | None,
+    recent_kd: float,
 ) -> float:
     improved = 0
     declined = 0
 
-    for _label, old, new, higher_is_better in metrics:
-        if abs(new - old) < 0.01:
+    thresholds = {
+        "K/D": 0.03,
+        "AVG": 0.5,
+        "винрейт": 3.0,
+        "opening kills": 0.2,
+    }
+
+    for label, old, new, higher_is_better in metrics:
+        raw_delta = new - old
+        delta = raw_delta if higher_is_better else -raw_delta
+        threshold = thresholds.get(label, 0.05)
+        if abs(raw_delta) < threshold * 0.4:
             continue
-        if (new > old) == higher_is_better:
+        if delta > threshold:
             improved += 1
-        else:
+        elif delta < -threshold:
             declined += 1
 
     if elo_delta is not None:
-        if elo_delta > 0:
+        if elo_delta > 10:
             improved += 1
-        elif elo_delta < 0:
+        elif elo_delta < -10:
             declined += 1
 
-    total = improved + declined
-    if total == 0:
-        return 5.5
-    if improved > declined and improved / total >= 0.6:
-        return min(10.0, 8.0 + (improved - declined) * 0.5)
-    if declined > improved and declined / total >= 0.6:
-        return max(1.0, 4.5 - (declined - improved) * 0.5)
-    return max(1.0, min(10.0, 5.0 + (improved - declined)))
+    diff = improved - declined
+    if diff >= 2:
+        score = min(10.0, 8.0 + diff * 0.35)
+    elif diff <= -2:
+        score = max(1.0, 4.0 + diff * 0.35)
+    else:
+        score = max(5.0, min(7.0, 6.0 + diff * 0.5))
+
+    if recent_kd >= 1.2:
+        score = max(6.0, score)
+
+    return max(1.0, min(10.0, score))
 
 
-def find_growth_zone(items: list[dict[str, Any]]) -> str | None:
-    """Карта с наименьшим винрейтом (минимум 3 игры)."""
-    pool: dict[str, dict[str, int]] = {}
+def find_growth_zones(
+    older: PeriodStats,
+    recent: PeriodStats,
+    lifetime_hs_pct: float | None,
+) -> list[str]:
+    """1–2 самые проблемные зоны роста по навыкам."""
+    issues: list[tuple[float, str]] = []
 
-    for item in items:
-        stats = _game_stats_item_stats(item)
-        map_key = normalize_map_key(stats.get("Map") or stats.get("map"))
-        if not map_key:
-            continue
-        won = parse_match_win(stats)
-        if won is None:
-            continue
-        bucket = pool.setdefault(map_key, {"wins": 0, "played": 0})
-        bucket["played"] += 1
-        if won:
-            bucket["wins"] += 1
+    if (
+        recent.clutch_1vx_win_rate is not None
+        and older.clutch_1vx_win_rate is not None
+    ):
+        drop = (older.clutch_1vx_win_rate - recent.clutch_1vx_win_rate) * 100
+        if drop >= 8:
+            issues.append(
+                (
+                    drop,
+                    f"Клатчи: winrate в 1vX снизился на {drop:.0f}%",
+                )
+            )
+        elif recent.clutch_1vx_win_rate < 0.35:
+            issues.append(
+                (
+                    35 - recent.clutch_1vx_win_rate * 100,
+                    f"Клатчи: низкий winrate в 1vX ({recent.clutch_1vx_win_rate * 100:.0f}%)",
+                )
+            )
 
-    candidates: list[tuple[float, str]] = []
-    for map_key, data in pool.items():
-        if data["played"] < 3:
-            continue
-        win_rate = data["wins"] / data["played"] * 100
-        candidates.append((win_rate, format_map_name(map_key)))
+    opening_rise = (recent.opening_death_rate - older.opening_death_rate) * 100
+    if opening_rise >= 5 or recent.opening_death_rate >= 0.22:
+        severity = max(opening_rise, recent.opening_death_rate * 100 - 15)
+        issues.append(
+            (
+                severity,
+                "Позиционная игра: частые смерти на early contact за CT",
+            )
+        )
 
-    if not candidates:
-        return None
+    if recent.entry_win_rate is not None:
+        if older.entry_win_rate is not None:
+            entry_drop = (older.entry_win_rate - recent.entry_win_rate) * 100
+            if entry_drop >= 8:
+                issues.append(
+                    (
+                        entry_drop,
+                        f"Энтри: entry winrate снизился на {entry_drop:.0f}%",
+                    )
+                )
+        if recent.entry_win_rate < 0.45:
+            issues.append(
+                (
+                    45 - recent.entry_win_rate * 100,
+                    f"Энтри: низкий entry winrate ({recent.entry_win_rate * 100:.0f}%)",
+                )
+            )
 
-    win_rate, map_name = min(candidates, key=lambda item: item[0])
-    return f"игра на {map_name} — винрейт {win_rate:.0f}%"
+    tempo_drop = older.early_attack_impact - recent.early_attack_impact
+    if tempo_drop >= 0.4:
+        issues.append(
+            (
+                tempo_drop * 10,
+                "Темп игры: мало impact в первые 30 сек раунда в атаке",
+            )
+        )
+
+    benchmark_hs = lifetime_hs_pct if lifetime_hs_pct else 50.0
+    if recent.hs_pct > 0 and recent.hs_pct < benchmark_hs - 8:
+        issues.append(
+            (
+                benchmark_hs - recent.hs_pct,
+                f"Аим: низкий HS% ({recent.hs_pct:.0f}% vs ~{benchmark_hs:.0f}% "
+                "для твоего уровня)",
+            )
+        )
+
+    if not issues:
+        return []
+
+    issues.sort(key=lambda item: item[0], reverse=True)
+    return [message for _, message in issues[:2]]
 
 
 def collect_player_game_stat_items(
@@ -2074,8 +2480,15 @@ def build_user_progress(
     if not player_id:
         raise ValueError(f"Игрок «{nickname}» не найден на Faceit.")
 
-    service.get_player_cs2_stats(player_id)
+    cs2_stats = service.get_player_cs2_stats(player_id)
     service.get_player_history(player_id, limit=requested_matches)
+    lifetime_hs_raw = _first_present(cs2_stats.get("lifetime") or {}, STAT_HS_KEYS)
+    lifetime_hs_pct: float | None = None
+    if lifetime_hs_raw is not None:
+        try:
+            lifetime_hs_pct = _as_percent(_parse_float(lifetime_hs_raw))
+        except ValueError:
+            lifetime_hs_pct = None
 
     items = collect_player_game_stat_items(service, player_id, requested_matches)
     available = len(items)
@@ -2116,9 +2529,9 @@ def build_user_progress(
 
     metrics = _metric_changes(older, recent)
     improved, declined = _pick_improved_declined(metrics)
-    form_score = compute_form_score(metrics, elo_delta)
+    form_score = compute_form_score(metrics, elo_delta, recent.kd)
     style = detect_playstyle_from_matches(items)
-    growth_zone = find_growth_zone(items)
+    growth_zones = find_growth_zones(older, recent, lifetime_hs_pct)
 
     return ProgressReport(
         style=style,
@@ -2129,7 +2542,7 @@ def build_user_progress(
         elo_delta=elo_delta,
         improved=improved,
         declined=declined,
-        growth_zone=growth_zone,
+        growth_zones=growth_zones,
         requested_count=requested_matches,
         match_count=available,
         partial_note=partial_note,
@@ -2180,8 +2593,12 @@ def format_progress_report(report: ProgressReport) -> str:
     else:
         lines.append("⚠️ Просадка: —")
 
-    lines.extend(["", "🎯 Зона роста:"])
-    lines.append(report.growth_zone or "— недостаточно данных по картам")
+    lines.extend(["", "🎯 ЗОНА РОСТА:"])
+    if report.growth_zones:
+        for zone in report.growth_zones:
+            lines.append(f"• {zone}")
+    else:
+        lines.append("• — явных слабых зон не найдено")
 
     return "\n".join(lines)
 
@@ -2197,7 +2614,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "2. Отправь ссылку на матч — проанализирую команду соперников.\n"
         "3. /progress — прогресс за 15, 50 или 100 матчей (кнопки).\n\n"
         "Сравнение по K/D и AVG на выбранной карте. "
-        "Точка игрока — по роли в матче или по heatmap (последние игры на карте)."
+        "Позиция — по роли/heatmap Faceit; если данных нет — «?». "
+        "На Dust2 и Overpass позиции не показываются."
     )
 
 
