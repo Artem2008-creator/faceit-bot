@@ -71,12 +71,15 @@ GLOBAL_FACEIT_BENCHMARKS: dict[str, float] = {
     "map_winrate": 50.0,
 }
 
-OPENING_DEATH_HIGH = 0.35
-WEAK_SPOT_CT_WINRATE_MAX = 35.0
-WEAK_SPOT_MAP_WINRATE_MAX = 30.0
-WEAK_SPOT_DECISION_OPENING_MIN = 0.30
-WEAK_SPOT_MECHANICS_HS_MAX = 35.0
-WEAK_SPOT_DUEL_KD_MAX = 0.9
+WEAKNESS_SHOW_MIN = 0.30
+WEAKNESS_FIRST_KILL_BENCHMARK = 0.5
+WEAKNESS_LABELS: dict[str, str] = {
+    "entry": "Первый контакт",
+    "ct_hold": "CT hold",
+    "clutch": "Клатчи 1vX",
+    "decision": "Принятие решений",
+    "mechanics": "Механика стрельбы",
+}
 
 MATCH_ID_PATTERN = re.compile(
     r"(1-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
@@ -360,8 +363,8 @@ PLAYSTYLE_OPENING_KILLS_BENCHMARK = 0.5
 PLAYSTYLE_ENTRY_RATE_BENCHMARK = 0.15
 PLAYSTYLE_FLASH_ASSISTS_BENCHMARK = 0.15
 PLAYSTYLE_ASSISTS_BENCHMARK = 5.0
-PLAYSTYLE_SCORE_CLOSE_GAP = 0.15
-PLAYSTYLE_MIXED_MAX = 0.3
+PLAYSTYLE_ENTRY_MIN_SCORE = 0.6
+PLAYSTYLE_CARRY_MIN_SCORE = 0.6
 
 # Человекочитаемые названия зон для паттернов CT/T
 MAP_ZONE_LABELS: dict[str, dict[str, str]] = {
@@ -2390,6 +2393,7 @@ def _compute_playstyle_scores(inputs: PlaystyleApiInputs) -> dict[str, float | N
         "support": None,
         "awper": None,
         "rifler": None,
+        "carry": None,
     }
 
     entry_value = inputs.opening_kills_per_round
@@ -2442,13 +2446,21 @@ def _compute_playstyle_scores(inputs: PlaystyleApiInputs) -> dict[str, float | N
     if awper_score > 0:
         scores["awper"] = min(0.8, awper_score)
 
+    if inputs.kd is not None and inputs.avg_kills is not None:
+        carry_score = 0.4
+        if inputs.kd > 1.5 and inputs.avg_kills > 25:
+            carry_score += 0.6
+        elif inputs.kd > 1.3 and inputs.avg_kills > 22:
+            carry_score += 0.4
+        scores["carry"] = min(1.0, carry_score)
+
     rifler_score = 0.35
-    other_scores = [
+    specialty_scores = [
         score
         for role, score in scores.items()
-        if role != "rifler" and score is not None
+        if role not in ("rifler", "carry") and score is not None
     ]
-    if other_scores and all(score < 0.5 for score in other_scores):
+    if specialty_scores and all(score < 0.5 for score in specialty_scores):
         rifler_score = 0.6
     if (
         inputs.kd is not None
@@ -2468,6 +2480,7 @@ PLAYSTYLE_ROLE_LABELS: dict[str, str] = {
     "support": "Support",
     "awper": "AWPer",
     "rifler": "Rifler",
+    "carry": "Carry",
 }
 
 
@@ -2475,27 +2488,38 @@ def _format_playstyle_score(score: float | None) -> str:
     return f"{score:.2f}" if score is not None else "n/a"
 
 
-def _select_playstyle_from_scores(scores: dict[str, float | None]) -> str:
-    available = {
-        role: score for role, score in scores.items() if score is not None
-    }
-    if not available:
-        return "Mixed"
-    if all(score < PLAYSTYLE_MIXED_MAX for score in available.values()):
-        return "Mixed"
+def _entry_opening_below_average(inputs: PlaystyleApiInputs) -> bool:
+    if inputs.opening_kills_per_round is not None:
+        return (
+            inputs.opening_kills_per_round < PLAYSTYLE_OPENING_KILLS_BENCHMARK
+        )
+    if inputs.entry_rate is not None:
+        return inputs.entry_rate < PLAYSTYLE_ENTRY_RATE_BENCHMARK
+    return True
 
-    ranked = sorted(available.items(), key=lambda item: item[1], reverse=True)
-    top_role, top_score = ranked[0]
-    if len(ranked) > 1:
-        second_role, second_score = ranked[1]
-        if (
-            top_score - second_score < PLAYSTYLE_SCORE_CLOSE_GAP
-            and second_score >= PLAYSTYLE_MIXED_MAX
-        ):
-            return (
-                f"{PLAYSTYLE_ROLE_LABELS[top_role]} / "
-                f"{PLAYSTYLE_ROLE_LABELS[second_role]}"
-            )
+
+def _select_playstyle_from_scores(
+    scores: dict[str, float | None],
+    inputs: PlaystyleApiInputs,
+) -> str:
+    eligible: dict[str, float] = {}
+
+    for role, score in scores.items():
+        if score is None:
+            continue
+        if role == "entry":
+            if score <= PLAYSTYLE_ENTRY_MIN_SCORE:
+                continue
+            if _entry_opening_below_average(inputs):
+                continue
+        if role == "carry" and score <= PLAYSTYLE_CARRY_MIN_SCORE:
+            continue
+        eligible[role] = score
+
+    if not eligible:
+        return PLAYSTYLE_ROLE_LABELS["rifler"]
+
+    top_role = max(eligible, key=eligible.get)
     return PLAYSTYLE_ROLE_LABELS[top_role]
 
 
@@ -2509,20 +2533,24 @@ def compute_player_playstyle(
     inputs = _extract_cs2_playstyle_inputs(cs2_stats)
     scores = _compute_playstyle_scores(inputs)
 
+    style = _select_playstyle_from_scores(scores, inputs)
+
     logger.info(
-        "Playstyle scores nick=%s player_id=%s entry=%s lurker=%s support=%s "
-        "awper=%s rifler=%s api_fields=%s",
+        "Playstyle selected nick=%s player_id=%s style=%s "
+        "entry=%s lurker=%s support=%s awper=%s rifler=%s carry=%s api_fields=%s",
         nickname,
         player_id,
+        style,
         _format_playstyle_score(scores["entry"]),
         _format_playstyle_score(scores["lurker"]),
         _format_playstyle_score(scores["support"]),
         _format_playstyle_score(scores["awper"]),
         _format_playstyle_score(scores["rifler"]),
+        _format_playstyle_score(scores["carry"]),
         list(inputs.fields_used),
     )
 
-    return _select_playstyle_from_scores(scores)
+    return style
 
 
 def resolve_skill_level(player: dict[str, Any], current_elo: int | None) -> int:
@@ -2653,8 +2681,8 @@ def _growth_tiebreak_seed(player_id: str, category: str) -> int:
     return int(digest[:8], 16)
 
 
-def _duel_kd_from_items(items: list[dict[str, Any]]) -> float | None:
-    """K/D в дуэлях 1v1: победы / поражения по статистике матчей."""
+def _duel_winrate_from_items(items: list[dict[str, Any]]) -> float | None:
+    """Winrate в дуэлях 1v1 по статистике матчей."""
     wins_total = 0.0
     count_total = 0.0
 
@@ -2665,149 +2693,142 @@ def _duel_kd_from_items(items: list[dict[str, Any]]) -> float | None:
 
     if count_total <= 0:
         return None
+    return wins_total / count_total
 
-    losses = count_total - wins_total
-    if losses <= 0:
-        return wins_total if wins_total > 0 else None
-    return wins_total / losses
+
+def _no_trade_deaths_rate(recent: PeriodStats) -> float:
+    """Доля смертей без размена (прокси: opening deaths при проигранном entry)."""
+    entry_wr = recent.entry_win_rate if recent.entry_win_rate is not None else 0.5
+    return max(0.0, min(1.0, recent.opening_death_rate * (1.0 - entry_wr)))
+
+
+def _clamp_weakness_score(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _weakness_severity_label(score: float) -> str:
+    if score > 0.70:
+        return "главная уязвимость"
+    if score > 0.50:
+        return "заметная проблема"
+    return "слабая зона"
+
+
+def _compute_weakness_scores(context: GrowthContext) -> dict[str, float]:
+    recent = context.recent
+    recent_items = list(context.recent_items)
+    lifetime = context.cs2_stats.get("lifetime") or {}
+
+    opening_death = _clamp_weakness_score(recent.opening_death_rate)
+    entry_wr = (
+        recent.entry_win_rate
+        if recent.entry_win_rate is not None
+        else GLOBAL_FACEIT_BENCHMARKS["entry_winrate"]
+    )
+    low_first_kill_rate = _clamp_weakness_score(
+        1.0 - recent.first_kills_avg / WEAKNESS_FIRST_KILL_BENCHMARK
+    )
+
+    entry_weakness = _clamp_weakness_score(
+        opening_death * 0.4
+        + (1.0 - entry_wr) * 0.4
+        + low_first_kill_rate * 0.2
+    )
+
+    ct_wr_raw = _ct_win_rate_from_items(recent_items)
+    ct_wr = (
+        ct_wr_raw / 100.0
+        if ct_wr_raw is not None
+        else GLOBAL_FACEIT_BENCHMARKS["ct_winrate"] / 100.0
+    )
+    hold_rating = compute_hold_rating(lifetime)
+    hold_value = (
+        hold_rating
+        if hold_rating is not None
+        else GLOBAL_FACEIT_BENCHMARKS["hold_rating"]
+    )
+    ct_hold_weakness = _clamp_weakness_score(
+        (1.0 - ct_wr) * 0.5 + (1.0 - hold_value) * 0.5
+    )
+
+    clutch_wr = (
+        recent.clutch_1vx_win_rate
+        if recent.clutch_1vx_win_rate is not None
+        else GLOBAL_FACEIT_BENCHMARKS["clutch_winrate"]
+    )
+    clutch_weakness = _clamp_weakness_score(1.0 - clutch_wr)
+
+    no_trade_rate = _no_trade_deaths_rate(recent)
+    decision_weakness = _clamp_weakness_score(
+        opening_death * 0.5 + no_trade_rate * 0.5
+    )
+
+    hs_ratio = (
+        recent.hs_pct / 100.0
+        if recent.hs_pct > 0
+        else GLOBAL_FACEIT_BENCHMARKS["hs_pct"] / 100.0
+    )
+    hs_ratio = _clamp_weakness_score(hs_ratio)
+    duel_wr = _duel_winrate_from_items(recent_items)
+    if duel_wr is None:
+        duel_wr = _clamp_weakness_score(recent.kd / (recent.kd + 1.0))
+    mechanics_weakness = _clamp_weakness_score(
+        (1.0 - hs_ratio) * 0.6 + (1.0 - duel_wr) * 0.4
+    )
+
+    return {
+        "entry": round(entry_weakness, 2),
+        "ct_hold": round(ct_hold_weakness, 2),
+        "clutch": round(clutch_weakness, 2),
+        "decision": round(decision_weakness, 2),
+        "mechanics": round(mechanics_weakness, 2),
+    }
+
+
+def _format_weakness_line(category: str, score: float) -> str:
+    label = WEAKNESS_LABELS[category]
+    severity = _weakness_severity_label(score)
+    return f"{label} ({score:.2f}) — {severity}"
 
 
 def find_growth_zones(context: GrowthContext) -> list[str]:
-    """
-    Слабые места: сравнение с глобальными эталонами Faceit.
-    Берём 2 зоны с наибольшим отставанием от эталона.
-    """
-    recent = context.recent
-    recent_items = list(context.recent_items)
-    benchmarks = GLOBAL_FACEIT_BENCHMARKS
-    lifetime = context.cs2_stats.get("lifetime") or {}
-    hold_rating = compute_hold_rating(lifetime)
-    ct_win_rate = _ct_win_rate_from_items(recent_items)
-    worst_map = _worst_map_from_items(recent_items)
-    duel_kd = _duel_kd_from_items(recent_items)
+    """Слабые места: scoring 0–1, top 2–3 зоны выше порога 0.30."""
+    scores = _compute_weakness_scores(context)
 
-    gaps: list[tuple[float, str, str]] = []
+    logger.info(
+        "Weakness scores nick=%s entry=%.2f ct_hold=%.2f clutch=%.2f "
+        "decision=%.2f mechanics=%.2f",
+        context.nickname,
+        scores["entry"],
+        scores["ct_hold"],
+        scores["clutch"],
+        scores["decision"],
+        scores["mechanics"],
+    )
 
-    entry_wr = recent.entry_win_rate
-    opening_high = recent.opening_death_rate > OPENING_DEATH_HIGH
-    entry_gap = 0.0
-    if entry_wr is not None and entry_wr < benchmarks["entry_winrate"]:
-        entry_gap = benchmarks["entry_winrate"] - entry_wr
-    if opening_high:
-        entry_gap = max(
-            entry_gap,
-            recent.opening_death_rate - OPENING_DEATH_HIGH,
-        )
-    if entry_gap > 0:
-        gaps.append(
-            (
-                entry_gap,
-                "entry",
-                "Первый контакт (часто умираешь первым, проигрываешь открытие раунда)",
-            )
-        )
-
-    if (
-        recent.opening_death_rate > WEAK_SPOT_DECISION_OPENING_MIN
-        and entry_wr is not None
-        and entry_wr < benchmarks["entry_winrate"]
-    ):
-        decision_gap = (
-            recent.opening_death_rate - WEAK_SPOT_DECISION_OPENING_MIN
-        ) + (benchmarks["entry_winrate"] - entry_wr)
-        gaps.append(
-            (
-                decision_gap,
-                "decisions",
-                "Принятие решений (неправильные решения в раунде, лишние пуши)",
-            )
-        )
-
-    clutch_wr = recent.clutch_1vx_win_rate
-    if clutch_wr is not None and clutch_wr < benchmarks["clutch_winrate"]:
-        gaps.append(
-            (
-                benchmarks["clutch_winrate"] - clutch_wr,
-                "clutch",
-                "Клатчи 1vX (низкий винрейт в клатчах)",
-            )
-        )
-
-    defense_gap = 0.0
-    if ct_win_rate is not None and ct_win_rate < WEAK_SPOT_CT_WINRATE_MAX:
-        defense_gap = max(
-            defense_gap, (WEAK_SPOT_CT_WINRATE_MAX - ct_win_rate) / 100
-        )
-    if hold_rating is not None and hold_rating < benchmarks["hold_rating"]:
-        defense_gap = max(
-            defense_gap, benchmarks["hold_rating"] - hold_rating
-        )
-    if defense_gap > 0:
-        gaps.append(
-            (
-                defense_gap,
-                "defense",
-                "Защита точки (теряешь много раундов на удержании)",
-            )
-        )
-
-    mechanics_gap = 0.0
-    if recent.hs_pct > 0 and recent.hs_pct < WEAK_SPOT_MECHANICS_HS_MAX:
-        mechanics_gap = max(
-            mechanics_gap,
-            (WEAK_SPOT_MECHANICS_HS_MAX - recent.hs_pct)
-            / WEAK_SPOT_MECHANICS_HS_MAX,
-        )
-    duel_kd_value = duel_kd if duel_kd is not None else recent.kd
-    if duel_kd_value < WEAK_SPOT_DUEL_KD_MAX:
-        mechanics_gap = max(
-            mechanics_gap,
-            (WEAK_SPOT_DUEL_KD_MAX - duel_kd_value) / WEAK_SPOT_DUEL_KD_MAX,
-        )
-    if mechanics_gap > 0:
-        gaps.append(
-            (
-                mechanics_gap,
-                "mechanics",
-                "Механика стрельбы (проигрываешь дуэли, нестабильный аим)",
-            )
-        )
-
-    if worst_map and worst_map[1] < WEAK_SPOT_MAP_WINRATE_MAX:
-        map_name, win_rate, _played = worst_map
-        gaps.append(
-            (
-                (WEAK_SPOT_MAP_WINRATE_MAX - win_rate) / 100,
-                f"map:{map_name}",
-                f"Карта {map_name} (винрейт {win_rate:.0f}%, заметно ниже среднего)",
-            )
-        )
-
-    if not gaps:
+    qualified = [
+        (category, score)
+        for category, score in scores.items()
+        if score > WEAKNESS_SHOW_MIN
+    ]
+    if not qualified:
         logger.info(
             "Слабые места для %s: %s", context.nickname, [GROWTH_NO_ISSUES_MSG]
         )
         return [GROWTH_NO_ISSUES_MSG]
 
-    gaps.sort(
+    qualified.sort(
         key=lambda item: (
-            -item[0],
-            _growth_tiebreak_seed(context.player_id, item[1]),
+            -item[1],
+            _growth_tiebreak_seed(context.player_id, item[0]),
         )
     )
+    top_count = min(3, len(qualified))
+    result = [
+        _format_weakness_line(category, score)
+        for category, score in qualified[:top_count]
+    ]
 
-    picked: list[str] = []
-    used_categories: set[str] = set()
-    for _gap, category, label in gaps:
-        base_category = category.split(":", 1)[0]
-        if base_category in used_categories:
-            continue
-        picked.append(label)
-        used_categories.add(base_category)
-        if len(picked) >= 2:
-            break
-
-    result = picked if picked else [GROWTH_NO_ISSUES_MSG]
     logger.info("Слабые места для %s: %s", context.nickname, result)
     return result
 
