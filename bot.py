@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import logging
 import re
 import threading
@@ -57,19 +58,20 @@ PROGRESS_MIN_MATCHES = 2
 PROGRESS_ELO_PER_WIN = 25
 PROGRESS_CALLBACK_PREFIX = "progress:"
 
-# Средние показатели игроков Faceit по уровню (skill level 1–10)
-SKILL_LEVEL_BENCHMARKS: dict[int, dict[str, float]] = {
-    1: {"kd": 0.72, "avg_kills": 13.5, "hs_pct": 40.0, "win_rate": 47.0},
-    2: {"kd": 0.78, "avg_kills": 14.0, "hs_pct": 42.0, "win_rate": 48.0},
-    3: {"kd": 0.85, "avg_kills": 14.5, "hs_pct": 44.0, "win_rate": 49.0},
-    4: {"kd": 0.92, "avg_kills": 15.0, "hs_pct": 46.0, "win_rate": 50.0},
-    5: {"kd": 0.98, "avg_kills": 15.5, "hs_pct": 47.0, "win_rate": 50.0},
-    6: {"kd": 1.02, "avg_kills": 16.0, "hs_pct": 48.0, "win_rate": 51.0},
-    7: {"kd": 1.08, "avg_kills": 16.5, "hs_pct": 49.0, "win_rate": 51.5},
-    8: {"kd": 1.14, "avg_kills": 17.0, "hs_pct": 50.0, "win_rate": 52.0},
-    9: {"kd": 1.20, "avg_kills": 17.5, "hs_pct": 51.0, "win_rate": 52.5},
-    10: {"kd": 1.28, "avg_kills": 18.5, "hs_pct": 52.0, "win_rate": 53.0},
+# Средние показатели по всей базе Faceit (все игроки)
+GLOBAL_FACEIT_BENCHMARKS: dict[str, float] = {
+    "kd": 1.0,
+    "avg_kills": 17.5,
+    "hs_pct": 45.0,
+    "entry_winrate": 0.45,
+    "clutch_winrate": 0.35,
+    "opening_death_rate": 0.15,
+    "ct_winrate": 50.0,
+    "hold_rating": 0.55,
+    "map_winrate": 50.0,
 }
+
+OPENING_DEATH_HIGH = 0.20
 
 MATCH_ID_PATTERN = re.compile(
     r"(1-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
@@ -2146,13 +2148,12 @@ class PeriodStats:
 
 @dataclass
 class GrowthContext:
-    """Данные для ZONE OF GROWTH — причины слабости (не сравнение периодов)."""
+    """Свежие данные игрока для ZONE OF GROWTH (без кэша между запросами)."""
+    nickname: str
+    player_id: str
     recent: PeriodStats
-    kd_volatility: float
-    ct_win_rate: float | None
-    hold_rating: float | None
-    worst_map: tuple[str, float, int] | None
-    benchmarks: dict[str, float]
+    recent_items: list[dict[str, Any]]
+    cs2_stats: dict[str, Any]
 
 
 @dataclass
@@ -2281,15 +2282,15 @@ class PlaystyleMetrics:
     match_count: int
 
 
-def _playstyle_metrics_from_items(
-    items: list[dict[str, Any]], recent: PeriodStats
-) -> PlaystyleMetrics:
+def _playstyle_metrics_from_items(items: list[dict[str, Any]]) -> PlaystyleMetrics:
+    """Метрики стиля только из матчей текущего запроса (без fallback на PeriodStats)."""
     first_kills_total = 0.0
     sniper_total = 0.0
     kills_total = 0.0
     flash_assists_total = 0.0
     clutch_wins = 0.0
     clutch_count = 0.0
+    deaths_total = 0.0
     count = 0
 
     for item in items:
@@ -2300,6 +2301,7 @@ def _playstyle_metrics_from_items(
         )
         sniper_total += _parse_optional_stat(stats, STAT_SNIPER_KILLS_KEYS) or 0.0
         kills_total += _parse_optional_stat(stats, STAT_KILLS_KEYS) or 0.0
+        deaths_total += _parse_optional_stat(stats, STAT_MATCH_DEATHS_KEYS) or 0.0
         flash_assists_total += (
             _parse_optional_stat(stats, STAT_FLASH_ASSISTS_KEYS) or 0.0
         )
@@ -2310,58 +2312,22 @@ def _playstyle_metrics_from_items(
             _parse_optional_stat(stats, STAT_1V2_COUNT_KEYS) or 0.0
         )
 
-    opening_avg = first_kills_total / count if count else recent.first_kills_avg
+    opening_avg = first_kills_total / count if count else 0.0
     awp_share = sniper_total / kills_total if kills_total > 0 else 0.0
-    clutch_wr = (
-        clutch_wins / clutch_count
-        if clutch_count > 0
-        else (recent.clutch_1vx_win_rate or 0.0)
-    )
+    clutch_wr = clutch_wins / clutch_count if clutch_count > 0 else 0.0
     flash_avg = flash_assists_total / count if count else 0.0
+    kd = kills_total / deaths_total if deaths_total > 0 else 0.0
+    avg_kills = kills_total / count if count else 0.0
 
     return PlaystyleMetrics(
         opening_kills_avg=opening_avg,
         awp_kill_share=awp_share,
         clutch_win_rate=clutch_wr,
         flash_assists_avg=flash_avg,
-        kd=recent.kd,
-        avg_kills=recent.avg_kills,
+        kd=kd,
+        avg_kills=avg_kills,
         match_count=count,
     )
-
-
-def _playstyle_proximity_scores(metrics: PlaystyleMetrics) -> dict[str, float]:
-    """Насколько статистика близка к порогам каждой роли (1.0 = порог достигнут)."""
-    lurker_score = 0.0
-    if metrics.opening_kills_avg < 0.9 and metrics.awp_kill_share < 0.10:
-        lurker_score = min(
-            1.0,
-            (0.9 - metrics.opening_kills_avg) / 0.9 * 0.5
-            + (0.10 - metrics.awp_kill_share) / 0.10 * 0.5,
-        )
-
-    carry_kd = min(1.0, metrics.kd / 1.2) if metrics.kd > 0 else 0.0
-    carry_avg = min(1.0, metrics.avg_kills / 20.0) if metrics.avg_kills > 0 else 0.0
-    rifler_score = min(
-        1.0,
-        metrics.kd / 1.0 * 0.5 + metrics.avg_kills / 16.0 * 0.5,
-    )
-
-    return {
-        "Entry Fragger": (
-            metrics.opening_kills_avg / 1.2 if metrics.opening_kills_avg > 0 else 0.0
-        ),
-        "AWPer": metrics.awp_kill_share / 0.30 if metrics.awp_kill_share > 0 else 0.0,
-        "Clutcher": (
-            metrics.clutch_win_rate / 0.50 if metrics.clutch_win_rate > 0 else 0.0
-        ),
-        "Support": (
-            metrics.flash_assists_avg / 0.5 if metrics.flash_assists_avg > 0 else 0.0
-        ),
-        "Carry": (carry_kd + carry_avg) / 2.0,
-        "Lurker": lurker_score,
-        "Rifler": rifler_score,
-    }
 
 
 def compute_player_playstyle(
@@ -2371,55 +2337,37 @@ def compute_player_playstyle(
     nickname: str = "",
     player_id: str = "",
 ) -> str:
-    """Стиль только по статистике последних матчей (локальные данные игрока)."""
-    metrics = _playstyle_metrics_from_items(items, recent)
+    """Стиль по свежей статистике матчей (без кэша и глобального состояния)."""
+    _ = recent  # PeriodStats не используется — только items текущего запроса
+    fresh_items = list(items)
+    metrics = _playstyle_metrics_from_items(fresh_items)
+
     logger.info(
-        "Progress playstyle nick=%s player_id=%s opening_kills=%.2f awp_share=%.0f%% "
-        "clutch_wr=%.0f%% flash_assists=%.2f kd=%.2f avg=%.1f matches=%d",
+        "Анализирую игрока %s, opening_kills=%.2f, AWP%%=%.0f, clutch%%=%.0f",
         nickname,
-        player_id,
         metrics.opening_kills_avg,
         metrics.awp_kill_share * 100,
         metrics.clutch_win_rate * 100,
-        metrics.flash_assists_avg,
-        metrics.kd,
-        metrics.avg_kills,
-        metrics.match_count,
     )
 
-    if metrics.match_count == 0 and metrics.kd <= 0:
-        style = "Rifler"
-        logger.info("Progress playstyle result=%s (no match data)", style)
-        return style
+    if metrics.match_count == 0:
+        return "Mixed"
 
-    qualified: list[tuple[float, str]] = []
     if metrics.opening_kills_avg > 1.2:
-        qualified.append(
-            ("Entry Fragger", metrics.opening_kills_avg / 1.2)
-        )
+        return "Entry Fragger"
     if metrics.awp_kill_share > 0.30:
-        qualified.append(("AWPer", metrics.awp_kill_share / 0.30))
+        return "AWPer"
     if metrics.clutch_win_rate > 0.50:
-        qualified.append(("Clutcher", metrics.clutch_win_rate / 0.50))
+        return "Clutcher"
     if metrics.flash_assists_avg > 0.5:
-        qualified.append(("Support", metrics.flash_assists_avg / 0.5))
+        return "Support"
     if metrics.kd > 1.2 and metrics.avg_kills > 20:
-        qualified.append(
-            (
-                "Carry",
-                min(metrics.kd / 1.2, metrics.avg_kills / 20.0),
-            )
-        )
-
-    if qualified:
-        style = max(qualified, key=lambda item: item[1])[0]
-        logger.info("Progress playstyle result=%s (threshold match)", style)
-        return style
-
-    proximity = _playstyle_proximity_scores(metrics)
-    style = max(proximity, key=proximity.get)
-    logger.info("Progress playstyle result=%s proximity=%s", style, proximity)
-    return style
+        return "Carry"
+    if metrics.opening_kills_avg < 0.5 and metrics.awp_kill_share < 0.10:
+        return "Lurker"
+    if metrics.kd > 1.0:
+        return "Rifler"
+    return "Mixed"
 
 
 def resolve_skill_level(player: dict[str, Any], current_elo: int | None) -> int:
@@ -2439,109 +2387,26 @@ def resolve_skill_level(player: dict[str, Any], current_elo: int | None) -> int:
     return 5
 
 
-def get_level_benchmarks(
-    cs2_stats: dict[str, Any], skill_level: int
-) -> dict[str, float]:
-    """Бенчмарки уровня: из API (если есть) или таблица по skill level."""
-    defaults = SKILL_LEVEL_BENCHMARKS.get(
-        skill_level, SKILL_LEVEL_BENCHMARKS[5]
-    ).copy()
+def compute_performance_rank(recent: PeriodStats) -> int:
+    """Performance rank 0–100 vs средние показатели всей базы Faceit."""
+    rank = 50
 
-    containers: list[dict[str, Any]] = []
-    if isinstance(cs2_stats.get("player_skills"), dict):
-        containers.append(cs2_stats["player_skills"])
-    for segment in cs2_stats.get("segments") or []:
-        seg_type = (segment.get("type") or "").lower()
-        if seg_type in ("benchmark", "benchmarks", "peer", "level", "elo"):
-            stats = segment.get("stats")
-            if isinstance(stats, dict):
-                containers.append(stats)
+    if recent.kd > 1.8:
+        rank += 40
+    elif recent.kd > 1.5:
+        rank += 30
+    elif recent.kd > 1.2:
+        rank += 20
 
-    key_map = {
-        "kd": ("kd", "k/d", "average k/d ratio", "average_kd"),
-        "avg_kills": ("avg", "avg_kills", "average kills", "kills"),
-        "hs_pct": ("hs", "headshot", "hs_pct", "average headshots"),
-        "win_rate": ("win", "win_rate", "win rate"),
-    }
+    if recent.avg_kills > 25:
+        rank += 30
+    elif recent.avg_kills > 20:
+        rank += 20
 
-    for container in containers:
-        for target, aliases in key_map.items():
-            for alias in aliases:
-                for key, value in container.items():
-                    if alias not in str(key).lower():
-                        continue
-                    try:
-                        parsed = _parse_float(value)
-                    except (TypeError, ValueError):
-                        continue
-                    if target == "hs_pct":
-                        parsed = _as_percent(parsed)
-                    elif target == "win_rate":
-                        parsed = _as_percent(parsed)
-                    defaults[target] = parsed
-                    break
+    if recent.hs_pct > 50:
+        rank += 15
 
-    return defaults
-
-
-def compute_form_score(
-    recent: PeriodStats,
-    benchmarks: dict[str, float],
-) -> float:
-    """Форма vs средние показатели игроков того же уровня Faceit."""
-    score = 5.0
-    beats = 0
-    compared = 0
-
-    kd_bench = benchmarks["kd"]
-    compared += 1
-    if recent.kd >= kd_bench * 1.2:
-        score += 2.0
-        beats += 1
-    elif recent.kd <= kd_bench * 0.8:
-        score -= 2.0
-
-    avg_bench = benchmarks["avg_kills"]
-    compared += 1
-    if recent.avg_kills >= avg_bench * 1.2:
-        score += 2.0
-        beats += 1
-    elif recent.avg_kills <= avg_bench * 0.8:
-        score -= 2.0
-
-    if recent.hs_pct > 0:
-        compared += 1
-        hs_bench = benchmarks["hs_pct"]
-        if recent.hs_pct >= hs_bench * 1.15 or recent.hs_pct >= hs_bench + 4:
-            score += 1.0
-            beats += 1
-        elif recent.hs_pct <= hs_bench * 0.85 and recent.hs_pct <= hs_bench - 4:
-            score -= 1.0
-
-    compared += 1
-    wr_bench = benchmarks["win_rate"]
-    if recent.win_rate >= wr_bench + 5:
-        score += 1.0
-        beats += 1
-    elif recent.win_rate <= wr_bench - 5:
-        score -= 1.0
-
-    peer_ratio = beats / compared if compared else 0.5
-    if peer_ratio >= 0.75:
-        score = max(8.0, score)
-    elif peer_ratio <= 0.25:
-        score = min(4.0, score)
-        score = max(2.0, score)
-    else:
-        score = max(4.5, min(7.0, score))
-
-    return max(1.0, min(10.0, score))
-
-
-def compute_performance_rank(recent: PeriodStats, benchmarks: dict[str, float]) -> int:
-    """RANK: 0–100 vs игроки того же ELO (из оценки формы 1–10)."""
-    score_10 = compute_form_score(recent, benchmarks)
-    return max(0, min(100, round(score_10 * 10)))
+    return max(0, min(100, rank))
 
 
 def _kd_volatility_from_items(items: list[dict[str, Any]]) -> float:
@@ -2615,144 +2480,115 @@ def build_growth_context(
     recent_items: list[dict[str, Any]],
     recent: PeriodStats,
     cs2_stats: dict[str, Any],
-    benchmarks: dict[str, float],
+    *,
+    nickname: str,
+    player_id: str,
 ) -> GrowthContext:
-    lifetime = cs2_stats.get("lifetime") or {}
-    hold_rating = compute_hold_rating(lifetime)
-
     return GrowthContext(
+        nickname=nickname,
+        player_id=player_id,
         recent=recent,
-        kd_volatility=_kd_volatility_from_items(recent_items),
-        ct_win_rate=_ct_win_rate_from_items(recent_items),
-        hold_rating=hold_rating,
-        worst_map=_worst_map_from_items(recent_items),
-        benchmarks=benchmarks,
+        recent_items=list(recent_items),
+        cs2_stats=copy.deepcopy(cs2_stats),
     )
+
+
+def _growth_tiebreak_seed(player_id: str, category: str) -> int:
+    digest = hashlib.md5(f"{player_id}:{category}".encode()).hexdigest()
+    return int(digest[:8], 16)
 
 
 def find_growth_zones(context: GrowthContext) -> list[str]:
     """
-    ZONE OF GROWTH: причины слабости (что тянет винрейт вниз), не просадки метрик.
-    Приоритет: первый контакт → клатчи → защита → размены → карта.
+    ZONE OF GROWTH: сравнение с глобальными эталонами Faceit.
+    Берём 2 зоны с наибольшим отставанием от эталона.
     """
     recent = context.recent
-    benchmarks = context.benchmarks
-    candidates: list[tuple[int, float, str, str]] = []
+    recent_items = list(context.recent_items)
+    benchmarks = GLOBAL_FACEIT_BENCHMARKS
+    lifetime = context.cs2_stats.get("lifetime") or {}
+    hold_rating = compute_hold_rating(lifetime)
+    ct_win_rate = _ct_win_rate_from_items(recent_items)
+    worst_map = _worst_map_from_items(recent_items)
 
-    def add(priority: int, severity: float, category: str, detail: str) -> None:
-        candidates.append((priority, severity, category, detail))
+    gaps: list[tuple[float, str, str]] = []
 
     entry_wr = recent.entry_win_rate
-    opening_high = recent.opening_death_rate >= 0.20
-    dies_often = opening_high or (recent.kd < 0.95 and recent.opening_death_rate >= 0.14)
-
-    if entry_wr is not None and entry_wr < 0.45:
-        add(1, 0.45 - entry_wr, "entry", "Первый контакт (низкий entry winrate)")
+    opening_high = recent.opening_death_rate >= OPENING_DEATH_HIGH
+    entry_gap = 0.0
+    if entry_wr is not None and entry_wr < benchmarks["entry_winrate"]:
+        entry_gap = benchmarks["entry_winrate"] - entry_wr
     if opening_high:
-        add(1, recent.opening_death_rate, "entry", "Первый контакт (часто умираешь первым)")
-
-    if dies_often and recent.kd < 0.95:
-        if entry_wr is not None and entry_wr < 0.50:
-            add(
-                1,
-                max(0.0, 1.0 - recent.kd),
-                "entry",
-                "Первый контакт (слабые дуэли в начале раунда)",
-            )
-        else:
-            add(
-                4,
-                max(0.0, 0.95 - recent.kd),
-                "trades",
-                "Размены (часто проигрываешь первые контакты)",
-            )
+        entry_gap = max(
+            entry_gap,
+            recent.opening_death_rate - benchmarks["opening_death_rate"],
+        )
+    if entry_gap > 0:
+        gaps.append((entry_gap, "entry", "Первый контакт"))
 
     clutch_wr = recent.clutch_1vx_win_rate
-    if clutch_wr is not None and clutch_wr < 0.35:
-        add(2, 0.35 - clutch_wr, "clutch", "Клатчи 1vX (низкий winrate)")
-
-    if context.kd_volatility >= 0.32:
-        if entry_wr is not None and entry_wr < 0.52:
-            add(
-                1,
-                context.kd_volatility,
-                "entry",
-                "Первый контакт (нестабильность в первых дуэлях)",
-            )
-        elif clutch_wr is not None and clutch_wr < 0.45:
-            add(
-                2,
-                context.kd_volatility,
+    if clutch_wr is not None and clutch_wr < benchmarks["clutch_winrate"]:
+        gaps.append(
+            (
+                benchmarks["clutch_winrate"] - clutch_wr,
                 "clutch",
-                "Клатчи 1vX (нестабильность в решающих раундах)",
+                "Клатчи 1vX",
             )
-
-    hold_low = context.hold_rating is not None and context.hold_rating < 0.55
-    ct_low = context.ct_win_rate is not None and context.ct_win_rate < 45
-    anchor_losing = (
-        recent.win_rate < 40
-        and recent.opening_death_rate < 0.12
-        and recent.kd >= 0.90
-        and recent.played >= 4
-    )
-
-    if hold_low:
-        add(
-            3,
-            0.55 - (context.hold_rating or 0),
-            "defense",
-            "Защита точки (теряешь много раундов на удержании)",
-        )
-    elif ct_low:
-        add(
-            3,
-            (45 - (context.ct_win_rate or 0)) / 100,
-            "defense",
-            "Защита точки (низкий винрейт за CT)",
-        )
-    elif anchor_losing:
-        add(
-            3,
-            (45 - recent.win_rate) / 100,
-            "defense",
-            "Защита точки (теряешь много раундов на удержании)",
         )
 
+    defense_gap = 0.0
+    if ct_win_rate is not None and ct_win_rate < 40:
+        defense_gap = max(defense_gap, (40 - ct_win_rate) / 100)
+    if hold_rating is not None and hold_rating < benchmarks["hold_rating"]:
+        defense_gap = max(
+            defense_gap, benchmarks["hold_rating"] - hold_rating
+        )
+    if defense_gap > 0:
+        gaps.append((defense_gap, "defense", "Защита точки"))
+
+    trades_gap = 0.0
     if recent.kd < 0.9:
-        add(4, 0.9 - recent.kd, "trades", "Размены (низкий K/D)")
-    elif recent.avg_kills < benchmarks["avg_kills"] * 0.82:
-        add(
-            4,
-            (benchmarks["avg_kills"] - recent.avg_kills) / benchmarks["avg_kills"],
-            "trades",
-            "Размены (мало убийств за матч)",
+        trades_gap = max(trades_gap, 0.9 - recent.kd)
+    if recent.avg_kills < 15:
+        trades_gap = max(trades_gap, (15 - recent.avg_kills) / 15)
+    if trades_gap > 0:
+        gaps.append((trades_gap, "trades", "Размены"))
+
+    if worst_map and worst_map[1] < 35:
+        map_name, win_rate, _played = worst_map
+        gaps.append(
+            (
+                (35 - win_rate) / 100,
+                f"map:{map_name}",
+                f"Карта {map_name}",
+            )
         )
 
-    if context.worst_map and context.worst_map[1] < 35:
-        map_name, win_rate, _played = context.worst_map
-        add(
-            5,
-            (35 - win_rate) / 100,
-            "map",
-            f"{map_name} (винрейт {win_rate:.0f}%)",
-        )
-
-    if not candidates:
+    if not gaps:
+        logger.info("Зоны роста для %s: %s", context.nickname, [GROWTH_NO_ISSUES_MSG])
         return [GROWTH_NO_ISSUES_MSG]
 
-    candidates.sort(key=lambda item: (item[0], -item[1]))
+    gaps.sort(
+        key=lambda item: (
+            -item[0],
+            _growth_tiebreak_seed(context.player_id, item[1]),
+        )
+    )
+
     picked: list[str] = []
     used_categories: set[str] = set()
-
-    for _priority, _severity, category, detail in candidates:
-        if category in used_categories:
+    for _gap, category, label in gaps:
+        base_category = category.split(":", 1)[0]
+        if base_category in used_categories:
             continue
-        picked.append(detail)
-        used_categories.add(category)
+        picked.append(label)
+        used_categories.add(base_category)
         if len(picked) >= 2:
             break
 
-    return picked if picked else [GROWTH_NO_ISSUES_MSG]
+    result = picked if picked else [GROWTH_NO_ISSUES_MSG]
+    logger.info("Зоны роста для %s: %s", context.nickname, result)
+    return result
 
 
 def build_form_progress(older: PeriodStats, recent: PeriodStats) -> list[str]:
@@ -2963,24 +2799,20 @@ def build_user_progress(
     if current_elo is not None:
         elo_delta = (recent.wins - older.wins) * PROGRESS_ELO_PER_WIN
 
-    skill_level = resolve_skill_level(player, current_elo)
-    benchmarks = get_level_benchmarks(cs2_stats, skill_level)
     growth_context = build_growth_context(
-        recent_items, recent, cs2_stats, benchmarks
+        recent_items,
+        recent,
+        cs2_stats,
+        nickname=nickname,
+        player_id=player_id,
     )
     form_lines = build_form_progress(older, recent)
     trend_summary = build_trend_summary(older, recent)
-    performance_rank = compute_performance_rank(recent, benchmarks)
+    performance_rank = compute_performance_rank(recent)
     style = compute_player_playstyle(
         recent_items, recent, nickname=nickname, player_id=player_id
     )
     growth_zones = find_growth_zones(growth_context)
-    logger.info(
-        "Progress zones nick=%s player_id=%s zones=%s",
-        nickname,
-        player_id,
-        growth_zones,
-    )
 
     return ProgressReport(
         style=style,
@@ -3011,7 +2843,7 @@ def format_progress_report(report: ProgressReport) -> str:
             "📈 ТВОЙ ПРОГРЕСС",
             "",
             f"🏅 Стиль: {report.style}",
-            f"📊 Performance rank: {report.performance_rank}/100 (vs same ELO)",
+            f"📊 Performance rank: {report.performance_rank}/100 (vs all Faceit)",
             "",
             f"📊 Последние {report.match_count} матчей:",
             (
