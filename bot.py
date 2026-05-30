@@ -2713,29 +2713,20 @@ def classify_trend_direction(
 
 
 def compute_overall_form(performance_rank: int, trend: TrendDirection) -> str:
-    """Итоговая форма: абсолютный rank + направление тренда."""
-    if trend == "plateau":
-        if performance_rank > 80:
-            base = "✅ Высокий уровень"
-        elif performance_rank >= 50:
-            base = "➡️ Стабильная форма"
-        else:
-            base = "⚖️ Низкий уровень"
-        return f"{base} · Стабильно"
-
-    if performance_rank > 80:
-        if trend == "positive":
-            return "🔥 Пик формы (доминируешь)"
-        return "⚠️ Спад, но уровень высокий"
-
-    if performance_rank >= 50:
-        if trend == "positive":
-            return "📈 На подъёме"
-        return "📉 Требуется восстановление"
-
+    """Итоговая форма: rank/10 + модификатор тренда, формат X.X/10 (тренд)."""
+    base = performance_rank / 10.0
     if trend == "positive":
-        return "🔄 Выход из ямы"
-    return "🔻 Сложный период"
+        modifier = 0.5
+        trend_label = "растёт"
+    elif trend == "negative":
+        modifier = -1.0
+        trend_label = "снижается"
+    else:
+        modifier = 0.0
+        trend_label = "стабильно"
+
+    score = round(max(0.0, min(10.0, base + modifier)), 1)
+    return f"{score:.1f}/10 ({trend_label})"
 
 
 def build_trend_summary(older: PeriodStats, recent: PeriodStats) -> str:
