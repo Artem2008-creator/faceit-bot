@@ -15,8 +15,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # telegram_user_id → faceit nickname (только в памяти, сбрасывается при перезапуске)
 user_nicks: dict[int, str] = {}
@@ -35,8 +42,19 @@ GAME_STATS_FETCH_LIMIT = 40
 MIN_MAP_MATCHES_FOR_SKILL = 3
 MAP_POOL_MATCHES_LIMIT = 20
 MIN_MAP_MATCHES_FOR_REC = 3
+MAP_POOL_TOP_BANS = 2
+MAP_POOL_TOP_PICKS = 2
 SIDE_STYLE_MATCHES_LIMIT = 8
 MIN_SIDE_STYLE_MATCHES = 3
+CONFIDENCE_MIN_MATCHES = 10
+CONFIDENCE_MIN_PERCENT = 30
+CONFIDENCE_MAX_PERCENT = 95
+CONFIDENCE_BASE_PERCENT = 85
+CONFIDENCE_PENALTY_PER_PLAYER = 13
+PROGRESS_OPTIONS = (15, 50, 100)
+PROGRESS_MIN_MATCHES = 2
+PROGRESS_ELO_PER_WIN = 25
+PROGRESS_CALLBACK_PREFIX = "progress:"
 
 MATCH_ID_PATTERN = re.compile(
     r"(1-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
@@ -174,6 +192,8 @@ DEFAULT_ROLE_SITE = {
 FALLBACK_SITES = ("B", "A", "Mid", "B", "A")
 
 STAT_KD_KEYS = ("Average K/D Ratio", "K/D Ratio", "Average K/D", "kd_ratio")
+STAT_KILLS_KEYS = ("Kills",)
+STAT_AVG_KILLS_KEYS = ("Average Kills", "Avg Kills")
 STAT_ADR_KEYS = ("ADR", "Average ADR", "Average Damage / Round", "Average Damage per Round")
 STAT_HS_KEYS = ("Average Headshots %", "Headshots %", "Headshot %", "HS %")
 STAT_WIN_RATE_KEYS = ("Win Rate %",)
@@ -199,6 +219,9 @@ STAT_FLASH_VULN_KEYS = (
 STAT_MATCH_ROUNDS_KEYS = ("Rounds",)
 STAT_MATCH_DEATHS_KEYS = ("Deaths",)
 STAT_MATCH_FIRST_KILLS_KEYS = ("First Kills",)
+STAT_MATCH_ASSISTS_KEYS = ("Assists",)
+STAT_SNIPER_KILLS_KEYS = ("Sniper Kills",)
+STAT_MAP_MATCHES_KEYS = ("Total Matches", "Matches", "Total matches")
 STAT_PLANTS_KEYS = ("Bomb Plants", "Plants")
 STAT_DEFUSES_KEYS = ("Bomb Defuses", "Defuses")
 STAT_PISTOL_KILLS_KEYS = ("Pistol Kills",)
@@ -255,8 +278,7 @@ class FaceitNotFoundError(FaceitAPIError):
 @dataclass
 class MapSkill:
     kd_ratio: float
-    adr: float
-    hs_pct: float
+    avg_kills: float
 
 
 @dataclass
@@ -291,13 +313,15 @@ class MapRecommendation:
     display_name: str
     action: str
     opponent_win_rate: float
-    user_win_rate: float
+    user_win_rate: float | None
     verdict: str
 
 
 @dataclass
 class MapPoolAnalysis:
-    recommendations: list[MapRecommendation]
+    bans: list[MapRecommendation]
+    picks: list[MapRecommendation]
+    deciders: list[MapRecommendation]
 
 
 @dataclass
@@ -336,6 +360,13 @@ class AggregatedPlaystyleMetrics:
 
 
 @dataclass
+class ConfidenceScore:
+    percent: int
+    total_matches: int
+    low_match_players: int
+
+
+@dataclass
 class AnalysisResult:
     map_name: str
     map_key: str
@@ -344,6 +375,7 @@ class AnalysisResult:
     weakest: AnalyzedPlayer
     strongest: AnalyzedPlayer
     map_pool: MapPoolAnalysis | None
+    confidence: ConfidenceScore
     attack_advice: AttackAdvice | None = None
     playstyle: TeamPlaystyleAnalysis | None = None
 
@@ -406,6 +438,26 @@ class FaceitService:
             "GET",
             f"/players/{player_id}/games/cs2/stats",
             params={"offset": offset, "limit": limit},
+        )
+
+    def lookup_player_by_nickname(self, nickname: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            "/players",
+            params={"nickname": nickname, "game": "cs2"},
+        )
+
+    def get_player_history(
+        self,
+        player_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/players/{player_id}/history",
+            params={"game": "cs2", "offset": offset, "limit": limit},
         )
 
 
@@ -574,22 +626,38 @@ def get_map_segment_stats(stats_payload: dict[str, Any], map_key: str) -> dict[s
     return {}
 
 
-def parse_map_skill(stats: dict[str, Any]) -> MapSkill | None:
+def parse_map_skill_from_match(stats: dict[str, Any]) -> tuple[float, float] | None:
     kd_raw = _first_present(stats, STAT_KD_KEYS)
-    adr_raw = _first_present(stats, STAT_ADR_KEYS)
-    hs_raw = _first_present(stats, STAT_HS_KEYS)
+    kills_raw = _first_present(stats, STAT_KILLS_KEYS)
 
-    if kd_raw is None and adr_raw is None and hs_raw is None:
+    if kd_raw is None and kills_raw is None:
         return None
 
     try:
         kd = _parse_float(kd_raw, default=0.0) if kd_raw is not None else 0.0
-        adr = _parse_float(adr_raw, default=0.0) if adr_raw is not None else 0.0
-        hs = _parse_float(hs_raw, default=0.0) if hs_raw is not None else 0.0
+        kills = _parse_float(kills_raw, default=0.0) if kills_raw is not None else 0.0
     except ValueError:
         return None
 
-    return MapSkill(kd_ratio=kd, adr=adr, hs_pct=hs)
+    return kd, kills
+
+
+def parse_map_skill_from_segment(stats: dict[str, Any]) -> MapSkill | None:
+    kd_raw = _first_present(stats, STAT_KD_KEYS)
+    avg_kills_raw = _first_present(stats, STAT_AVG_KILLS_KEYS)
+
+    if kd_raw is None and avg_kills_raw is None:
+        return None
+
+    try:
+        kd = _parse_float(kd_raw, default=0.0) if kd_raw is not None else 0.0
+        avg_kills = (
+            _parse_float(avg_kills_raw, default=0.0) if avg_kills_raw is not None else 0.0
+        )
+    except ValueError:
+        return None
+
+    return MapSkill(kd_ratio=kd, avg_kills=avg_kills)
 
 
 def collect_recent_map_match_stats(
@@ -622,19 +690,97 @@ def collect_recent_map_match_stats(
     return per_match
 
 
+def get_player_map_match_count(
+    service: FaceitService, player_id: str, map_key: str
+) -> int:
+    """Количество матчей игрока на карте (из cs2 stats или истории game stats)."""
+    try:
+        cs2_stats = service.get_player_cs2_stats(player_id)
+    except (FaceitNotFoundError, FaceitAPIError):
+        cs2_stats = None
+
+    if cs2_stats:
+        map_stats = get_map_segment_stats(cs2_stats, map_key)
+        raw = _first_present(map_stats, STAT_MAP_MATCHES_KEYS) if map_stats else None
+        if raw is not None:
+            try:
+                return max(0, int(_parse_float(raw)))
+            except ValueError:
+                pass
+
+    try:
+        payload = service.get_player_game_stats(player_id, limit=GAME_STATS_FETCH_LIMIT)
+    except (FaceitNotFoundError, FaceitAPIError):
+        return 0
+
+    count = 0
+    for item in payload.get("items") or []:
+        item_stats = item.get("stats") if isinstance(item.get("stats"), dict) else {}
+        if normalize_map_key(item_stats.get("Map") or item_stats.get("map")) == map_key:
+            count += 1
+    return count
+
+
+def compute_confidence_score(player_map_counts: list[int]) -> ConfidenceScore:
+    total_matches = sum(player_map_counts)
+    low_match_players = sum(
+        1 for count in player_map_counts if count < CONFIDENCE_MIN_MATCHES
+    )
+
+    base = min(
+        CONFIDENCE_MAX_PERCENT,
+        max(CONFIDENCE_BASE_PERCENT, CONFIDENCE_BASE_PERCENT + total_matches // 18),
+    )
+    if low_match_players == 0:
+        percent = base
+    else:
+        percent = max(
+            CONFIDENCE_MIN_PERCENT,
+            base - low_match_players * CONFIDENCE_PENALTY_PER_PLAYER,
+        )
+
+    return ConfidenceScore(
+        percent=percent,
+        total_matches=total_matches,
+        low_match_players=low_match_players,
+    )
+
+
+def _low_match_players_warning(count: int) -> str:
+    if count == 1:
+        return "⚠️ У одного игрока менее 10 игр на карте."
+    if count == 2:
+        return "⚠️ У двух игроков менее 10 игр на карте."
+    return f"⚠️ У {count} игроков менее 10 игр на карте."
+
+
+def format_confidence(confidence: ConfidenceScore) -> list[str]:
+    lines = [f"📊 Надёжность анализа: {confidence.percent}%"]
+    if confidence.low_match_players == 0:
+        lines.append(f"(основано на {confidence.total_matches} матчах игроков)")
+    else:
+        lines.append(_low_match_players_warning(confidence.low_match_players))
+    lines.append("")
+    return lines
+
+
 def average_map_skill(match_stats_list: list[dict[str, Any]]) -> MapSkill | None:
-    skills: list[MapSkill] = []
+    kd_values: list[float] = []
+    kills_values: list[float] = []
+
     for stats in match_stats_list:
-        skill = parse_map_skill(stats)
-        if skill:
-            skills.append(skill)
-    if not skills:
+        parsed = parse_map_skill_from_match(stats)
+        if parsed is None:
+            continue
+        kd_values.append(parsed[0])
+        kills_values.append(parsed[1])
+
+    if not kills_values:
         return None
-    count = len(skills)
+
     return MapSkill(
-        kd_ratio=sum(s.kd_ratio for s in skills) / count,
-        adr=sum(s.adr for s in skills) / count,
-        hs_pct=sum(s.hs_pct for s in skills) / count,
+        kd_ratio=sum(kd_values) / len(kd_values),
+        avg_kills=sum(kills_values) / len(kills_values),
     )
 
 
@@ -646,7 +792,7 @@ def get_player_map_skill(service: FaceitService, player_id: str, map_key: str) -
 
     stats = service.get_player_cs2_stats(player_id)
     segment_stats = get_map_segment_stats(stats, map_key)
-    skill = parse_map_skill(segment_stats)
+    skill = parse_map_skill_from_segment(segment_stats)
     if skill is None:
         raise ValueError(
             f"Нет статистики на карте {format_map_name(map_key)} "
@@ -741,17 +887,16 @@ def detect_player_site(
     return FALLBACK_SITES[roster_index % len(FALLBACK_SITES)], "оценка"
 
 
-def skill_sort_key(player: AnalyzedPlayer) -> tuple[float, float, float]:
+def skill_sort_key(player: AnalyzedPlayer) -> tuple[float, float]:
     s = player.skill
-    return (s.kd_ratio, s.adr, s.hs_pct)
+    return (s.kd_ratio, s.avg_kills)
 
 
 def average_team_skill(players: list[AnalyzedPlayer]) -> MapSkill:
     count = len(players)
     return MapSkill(
         kd_ratio=sum(p.skill.kd_ratio for p in players) / count,
-        adr=sum(p.skill.adr for p in players) / count,
-        hs_pct=sum(p.skill.hs_pct for p in players) / count,
+        avg_kills=sum(p.skill.avg_kills for p in players) / count,
     )
 
 
@@ -765,6 +910,16 @@ def player_tier_emoji(
     if player.player_id == strongest.player_id:
         return "🟢"
     return "🟡"
+
+
+def format_main_threat(player: AnalyzedPlayer) -> list[str]:
+    skill = player.skill
+    return [
+        "",
+        "⚠️ ГЛАВНАЯ УГРОЗА:",
+        f"{player.nickname} — {player.site} "
+        f"(K/D: {skill.kd_ratio:.2f}, AVG: {skill.avg_kills:.0f})",
+    ]
 
 
 def parse_match_win(stats: dict[str, Any]) -> bool | None:
@@ -852,45 +1007,55 @@ def build_map_winrates_from_game_items(
 
 
 def classify_map_recommendation(
-    opponent_win_rate: float, user_win_rate: float
-) -> tuple[str, str]:
+    opponent_win_rate: float, user_win_rate: float | None
+) -> tuple[str, str] | None:
+    if user_win_rate is None:
+        return None
+
     gap = user_win_rate - opponent_win_rate
-
-    if opponent_win_rate >= 60 and user_win_rate <= 40:
-        return "ban", "100% бан"
-    if opponent_win_rate >= 55 and user_win_rate <= 45 and gap <= -10:
-        return "ban", "100% бан"
-
-    if opponent_win_rate <= 30 and user_win_rate >= 55:
-        return "pick", "уверенный пик"
-    if opponent_win_rate <= 40 and user_win_rate >= 50 and gap >= 15:
-        return "pick", "уверенный пик"
-
-    return "decider", "50/50, зависит от формы"
+    if gap <= -20:
+        return "ban", "уверенный бан"
+    if gap >= 10:
+        return "pick", "твоя карта"
+    return "decider", "равные шансы"
 
 
 def build_map_recommendations(
     opponent_pool: dict[str, dict[str, int]],
     user_pool: dict[str, dict[str, int]],
-) -> list[MapRecommendation]:
-    recommendations: list[MapRecommendation] = []
+) -> MapPoolAnalysis:
+    candidates: list[MapRecommendation] = []
 
     for map_key, opp_data in opponent_pool.items():
-        user_data = user_pool.get(map_key)
-        if not user_data:
-            continue
-        if (
-            opp_data["played"] < MIN_MAP_MATCHES_FOR_REC
-            or user_data["played"] < MIN_MAP_MATCHES_FOR_REC
-        ):
+        if opp_data["played"] < MIN_MAP_MATCHES_FOR_REC:
             continue
 
         opponent_win_rate = opp_data["wins"] / opp_data["played"] * 100
-        user_win_rate = user_data["wins"] / user_data["played"] * 100
-        action, verdict = classify_map_recommendation(
-            opponent_win_rate, user_win_rate
+        user_data = user_pool.get(map_key)
+        user_sufficient = (
+            user_data is not None and user_data["played"] >= MIN_MAP_MATCHES_FOR_REC
         )
-        recommendations.append(
+        user_win_rate: float | None = None
+        if user_sufficient and user_data is not None:
+            user_win_rate = user_data["wins"] / user_data["played"] * 100
+
+        classified = classify_map_recommendation(opponent_win_rate, user_win_rate)
+        if classified is None:
+            if not user_sufficient:
+                candidates.append(
+                    MapRecommendation(
+                        map_key=map_key,
+                        display_name=format_map_name(map_key),
+                        action="decider",
+                        opponent_win_rate=opponent_win_rate,
+                        user_win_rate=None,
+                        verdict="недостаточно данных",
+                    )
+                )
+            continue
+
+        action, verdict = classified
+        candidates.append(
             MapRecommendation(
                 map_key=map_key,
                 display_name=format_map_name(map_key),
@@ -901,15 +1066,66 @@ def build_map_recommendations(
             )
         )
 
-    action_order = {"ban": 0, "pick": 1, "decider": 2}
-    return sorted(
-        recommendations,
-        key=lambda rec: (
-            action_order.get(rec.action, 3),
-            -abs(rec.user_win_rate - rec.opponent_win_rate),
-            rec.display_name,
-        ),
+    def gap(rec: MapRecommendation) -> float:
+        return (rec.user_win_rate or 0.0) - rec.opponent_win_rate
+
+    bans = sorted(
+        (rec for rec in candidates if rec.action == "ban"),
+        key=gap,
+    )[:MAP_POOL_TOP_BANS]
+    picks = sorted(
+        (rec for rec in candidates if rec.action == "pick"),
+        key=gap,
+        reverse=True,
+    )[:MAP_POOL_TOP_PICKS]
+    deciders = sorted(
+        (rec for rec in candidates if rec.action == "decider"),
+        key=lambda rec: abs(gap(rec)),
     )
+
+    return MapPoolAnalysis(bans=bans, picks=picks, deciders=deciders)
+
+
+def _format_user_win_rate_line(rec: MapRecommendation) -> str:
+    if rec.user_win_rate is None:
+        return "— твой винрейт: недостаточно данных"
+    return f"— твой винрейт: {rec.user_win_rate:.0f}%"
+
+
+def _format_map_rec_lines(prefix: str, rec: MapRecommendation) -> list[str]:
+    return [
+        f"{prefix} {rec.display_name}",
+        f"— винрейт соперника: {rec.opponent_win_rate:.0f}%",
+        _format_user_win_rate_line(rec),
+        f"— вердикт: {rec.verdict}",
+        "",
+    ]
+
+
+def format_map_recommendations(analysis: MapPoolAnalysis) -> list[str]:
+    if not analysis.bans and not analysis.picks and not analysis.deciders:
+        return []
+
+    lines = ["", "🗺 BAN/PICK:", ""]
+
+    for rec in analysis.bans:
+        lines.extend(_format_map_rec_lines("❌ БАНИТЬ", rec))
+    for rec in analysis.picks:
+        lines.extend(_format_map_rec_lines("✅ ПИКАТЬ", rec))
+    for rec in analysis.deciders:
+        lines.extend(
+            [
+                f"🎯 ДЕСАЙДЕР: {rec.display_name}",
+                f"— винрейт соперника: {rec.opponent_win_rate:.0f}%",
+                _format_user_win_rate_line(rec),
+                f"— вердикт: {rec.verdict}",
+                "",
+            ]
+        )
+
+    if lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 def analyze_map_pool(
@@ -926,36 +1142,11 @@ def analyze_map_pool(
 
     opponent_pool = build_map_winrates_from_game_items(opponent_items)
     user_pool = build_map_winrates_from_game_items(user_items)
-    recommendations = build_map_recommendations(opponent_pool, user_pool)
+    analysis = build_map_recommendations(opponent_pool, user_pool)
 
-    if not recommendations:
+    if not analysis.bans and not analysis.picks and not analysis.deciders:
         return None
-    return MapPoolAnalysis(recommendations=recommendations)
-
-
-def format_map_recommendations(analysis: MapPoolAnalysis) -> list[str]:
-    action_labels = {
-        "ban": "❌ BAN",
-        "pick": "✅ PICK",
-        "decider": "⚠️ DECIDER",
-    }
-    lines = ["", "🗺 Карты:"]
-
-    for rec in analysis.recommendations:
-        label = action_labels.get(rec.action, rec.action.upper())
-        lines.extend(
-            [
-                f"{label} {rec.display_name}",
-                f"— винрейт соперника: {rec.opponent_win_rate:.0f}%",
-                f"— твой винрейт: {rec.user_win_rate:.0f}%",
-                f"— вердикт: {rec.verdict}",
-                "",
-            ]
-        )
-
-    if lines[-1] == "":
-        lines.pop()
-    return lines
+    return analysis
 
 
 def extract_opponent_team_match_stats(
@@ -1314,7 +1505,7 @@ def pick_attack_advice(
     for player in players:
         by_site.setdefault(player.site, []).append(player)
 
-    avg_key = (team_avg.kd_ratio, team_avg.adr, team_avg.hs_pct)
+    avg_key = (team_avg.kd_ratio, team_avg.avg_kills)
 
     def site_score(site: str) -> float:
         members = by_site[site]
@@ -1527,6 +1718,7 @@ def analyze_opponents(
 
     analyzed: list[AnalyzedPlayer] = []
     player_ids: list[str] = []
+    player_map_counts: list[int] = []
 
     for index, member in enumerate(roster):
         player_id = member.get("player_id")
@@ -1534,6 +1726,7 @@ def analyze_opponents(
         if not player_id:
             continue
         player_ids.append(player_id)
+        player_map_counts.append(get_player_map_match_count(service, player_id, map_key))
         try:
             skill = get_player_map_skill(service, player_id, map_key)
             site, site_source = detect_player_site(service, member, map_key, index)
@@ -1569,6 +1762,7 @@ def analyze_opponents(
     )
     attack_advice = build_attack_advice(analyzed, team_avg)
     playstyle = analyze_team_playstyle(service, player_ids, analyzed, map_key)
+    confidence = compute_confidence_score(player_map_counts)
 
     return AnalysisResult(
         map_name=map_name,
@@ -1578,6 +1772,7 @@ def analyze_opponents(
         weakest=weakest,
         strongest=strongest,
         map_pool=map_pool,
+        confidence=confidence,
         attack_advice=attack_advice,
         playstyle=playstyle,
     )
@@ -1585,11 +1780,10 @@ def analyze_opponents(
 
 def build_report(result: AnalysisResult) -> str:
     avg = result.team_avg
-    lines = [
+    lines = format_confidence(result.confidence) + [
         f"🔍 Карта: {result.map_name}",
         "",
-        f"📊 Среднее по команде: K/D {avg.kd_ratio:.2f} | ADR {avg.adr:.0f} | "
-        f"HS% {avg.hs_pct:.0f}%",
+        f"📊 Среднее по команде: K/D {avg.kd_ratio:.2f} | AVG {avg.avg_kills:.0f}",
         "",
         "👥 Команда соперника:",
     ]
@@ -1599,8 +1793,10 @@ def build_report(result: AnalysisResult) -> str:
         emoji = player_tier_emoji(player, result.weakest, result.strongest)
         lines.append(
             f"{emoji} {player.nickname} — {player.site} "
-            f"(K/D: {skill.kd_ratio:.2f}, ADR: {skill.adr:.0f}, HS%: {skill.hs_pct:.0f}%)"
+            f"(K/D: {skill.kd_ratio:.2f}, AVG: {skill.avg_kills:.0f})"
         )
+
+    lines.extend(format_main_threat(result.strongest))
 
     if result.attack_advice:
         lines.extend([""] + format_attack_advice(result.attack_advice))
@@ -1608,8 +1804,384 @@ def build_report(result: AnalysisResult) -> str:
     if result.playstyle and (result.playstyle.ct or result.playstyle.t):
         lines.extend([""] + format_playstyle_analysis(result.playstyle))
 
-    if result.map_pool and result.map_pool.recommendations:
+    if result.map_pool and (
+        result.map_pool.bans or result.map_pool.picks or result.map_pool.deciders
+    ):
         lines.extend(format_map_recommendations(result.map_pool))
+
+    return "\n".join(lines)
+
+
+@dataclass
+class PeriodStats:
+    kd: float
+    avg_kills: float
+    win_rate: float
+    wins: int
+    played: int
+    first_kills_avg: float
+
+
+@dataclass
+class ProgressReport:
+    style: str
+    form_score: float
+    older: PeriodStats
+    recent: PeriodStats
+    current_elo: int | None
+    elo_delta: int | None
+    improved: list[str]
+    declined: list[str]
+    growth_zone: str | None
+    requested_count: int
+    match_count: int
+    partial_note: str | None = None
+
+
+def _trend_arrow(old: float, new: float, *, higher_is_better: bool = True) -> str:
+    if abs(new - old) < 1e-6:
+        return "➡️"
+    improved = new > old if higher_is_better else new < old
+    return "↗️" if improved else "↘️"
+
+
+def _game_stats_item_stats(item: dict[str, Any]) -> dict[str, Any]:
+    stats = item.get("stats")
+    return stats if isinstance(stats, dict) else {}
+
+
+def _period_stats_from_items(items: list[dict[str, Any]]) -> PeriodStats | None:
+    if not items:
+        return None
+
+    kd_values: list[float] = []
+    kills_values: list[float] = []
+    first_kills_values: list[float] = []
+    wins = 0
+    played = 0
+
+    for item in items:
+        stats = _game_stats_item_stats(item)
+        played += 1
+        parsed = parse_map_skill_from_match(stats)
+        if parsed:
+            kd_values.append(parsed[0])
+            kills_values.append(parsed[1])
+        first_kills = _parse_optional_stat(stats, STAT_MATCH_FIRST_KILLS_KEYS)
+        if first_kills is not None:
+            first_kills_values.append(first_kills)
+        won = parse_match_win(stats)
+        if won:
+            wins += 1
+
+    if not kills_values:
+        return None
+
+    return PeriodStats(
+        kd=sum(kd_values) / len(kd_values),
+        avg_kills=sum(kills_values) / len(kills_values),
+        win_rate=wins / played * 100 if played else 0.0,
+        wins=wins,
+        played=played,
+        first_kills_avg=(
+            sum(first_kills_values) / len(first_kills_values)
+            if first_kills_values
+            else 0.0
+        ),
+    )
+
+
+def detect_playstyle_from_matches(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return "Rifler"
+
+    entry_total = 0.0
+    first_kills_total = 0.0
+    assists_total = 0.0
+    sniper_total = 0.0
+    count = 0
+
+    for item in items:
+        stats = _game_stats_item_stats(item)
+        count += 1
+        entry_total += _parse_optional_stat(stats, STAT_TOTAL_ENTRY_COUNT_KEYS) or 0.0
+        first_kills_total += _parse_optional_stat(stats, STAT_MATCH_FIRST_KILLS_KEYS) or 0.0
+        assists_total += _parse_optional_stat(stats, STAT_MATCH_ASSISTS_KEYS) or 0.0
+        sniper_total += _parse_optional_stat(stats, STAT_SNIPER_KILLS_KEYS) or 0.0
+
+    if count == 0:
+        return "Rifler"
+
+    first_kills_avg = first_kills_total / count
+    entry_avg = entry_total / count
+    assists_avg = assists_total / count
+    sniper_avg = sniper_total / count
+
+    if first_kills_avg >= 2.5 or entry_avg >= 4.5:
+        return "Entry Fragger"
+    if sniper_avg >= 5.0:
+        return "AWPer"
+    if assists_avg >= 5.5 and first_kills_avg < 2.0:
+        return "Support"
+    if entry_avg < 2.5 and first_kills_avg < 2.0:
+        return "Lurker"
+    return "Rifler"
+
+
+def _metric_changes(
+    older: PeriodStats, recent: PeriodStats
+) -> list[tuple[str, float, float, bool]]:
+    return [
+        ("K/D", older.kd, recent.kd, True),
+        ("AVG", older.avg_kills, recent.avg_kills, True),
+        ("винрейт", older.win_rate, recent.win_rate, True),
+        ("opening kills", older.first_kills_avg, recent.first_kills_avg, True),
+    ]
+
+
+def _pick_improved_declined(
+    metrics: list[tuple[str, float, float, bool]],
+    *,
+    max_items: int = 2,
+) -> tuple[list[str], list[str]]:
+    improved: list[tuple[float, str]] = []
+    declined: list[tuple[float, str]] = []
+
+    thresholds = {
+        "K/D": 0.03,
+        "AVG": 0.5,
+        "винрейт": 3.0,
+        "opening kills": 0.2,
+    }
+
+    for label, old, new, higher_is_better in metrics:
+        delta = new - old if higher_is_better else old - new
+        threshold = thresholds.get(label, 0.05)
+        if delta > threshold:
+            improved.append((delta, label))
+        elif delta < -threshold:
+            declined.append((-delta, label))
+
+    improved.sort(reverse=True)
+    declined.sort(reverse=True)
+    return (
+        [label for _, label in improved[:max_items]],
+        [label for _, label in declined[:max_items]],
+    )
+
+
+def compute_form_score(
+    metrics: list[tuple[str, float, float, bool]],
+    elo_delta: int | None,
+) -> float:
+    improved = 0
+    declined = 0
+
+    for _label, old, new, higher_is_better in metrics:
+        if abs(new - old) < 0.01:
+            continue
+        if (new > old) == higher_is_better:
+            improved += 1
+        else:
+            declined += 1
+
+    if elo_delta is not None:
+        if elo_delta > 0:
+            improved += 1
+        elif elo_delta < 0:
+            declined += 1
+
+    total = improved + declined
+    if total == 0:
+        return 5.5
+    if improved > declined and improved / total >= 0.6:
+        return min(10.0, 8.0 + (improved - declined) * 0.5)
+    if declined > improved and declined / total >= 0.6:
+        return max(1.0, 4.5 - (declined - improved) * 0.5)
+    return max(1.0, min(10.0, 5.0 + (improved - declined)))
+
+
+def find_growth_zone(items: list[dict[str, Any]]) -> str | None:
+    """Карта с наименьшим винрейтом (минимум 3 игры)."""
+    pool: dict[str, dict[str, int]] = {}
+
+    for item in items:
+        stats = _game_stats_item_stats(item)
+        map_key = normalize_map_key(stats.get("Map") or stats.get("map"))
+        if not map_key:
+            continue
+        won = parse_match_win(stats)
+        if won is None:
+            continue
+        bucket = pool.setdefault(map_key, {"wins": 0, "played": 0})
+        bucket["played"] += 1
+        if won:
+            bucket["wins"] += 1
+
+    candidates: list[tuple[float, str]] = []
+    for map_key, data in pool.items():
+        if data["played"] < 3:
+            continue
+        win_rate = data["wins"] / data["played"] * 100
+        candidates.append((win_rate, format_map_name(map_key)))
+
+    if not candidates:
+        return None
+
+    win_rate, map_name = min(candidates, key=lambda item: item[0])
+    return f"игра на {map_name} — винрейт {win_rate:.0f}%"
+
+
+def collect_player_game_stat_items(
+    service: FaceitService, player_id: str, limit: int
+) -> list[dict[str, Any]]:
+    """Последние матчи из /players/{id}/games/cs2/stats (с пагинацией)."""
+    collected: list[dict[str, Any]] = []
+    offset = 0
+
+    while len(collected) < limit:
+        page_limit = min(100, limit - len(collected))
+        payload = service.get_player_game_stats(
+            player_id, offset=offset, limit=page_limit
+        )
+        batch = list(payload.get("items") or [])
+        if not batch:
+            break
+        collected.extend(batch)
+        offset += len(batch)
+        if len(batch) < page_limit:
+            break
+
+    return collected[:limit]
+
+
+def progress_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            f"📈 Последние {count}",
+            callback_data=f"{PROGRESS_CALLBACK_PREFIX}{count}",
+        )
+        for count in PROGRESS_OPTIONS
+    ]
+    return InlineKeyboardMarkup([buttons])
+
+
+def build_user_progress(
+    service: FaceitService, nickname: str, requested_matches: int
+) -> ProgressReport:
+    player = service.lookup_player_by_nickname(nickname)
+    player_id = player.get("player_id")
+    if not player_id:
+        raise ValueError(f"Игрок «{nickname}» не найден на Faceit.")
+
+    service.get_player_cs2_stats(player_id)
+    service.get_player_history(player_id, limit=requested_matches)
+
+    items = collect_player_game_stat_items(service, player_id, requested_matches)
+    available = len(items)
+
+    if available < PROGRESS_MIN_MATCHES:
+        raise ValueError(
+            f"Недостаточно матчей для анализа (есть {available}, "
+            f"нужно минимум {PROGRESS_MIN_MATCHES})."
+        )
+
+    partial_note: str | None = None
+    if available < requested_matches:
+        partial_note = (
+            f"У тебя всего {available} матчей. Показаны все доступные данные."
+        )
+
+    half = available // 2
+    recent_items = items[:half]
+    older_items = items[half:available]
+
+    recent = _period_stats_from_items(recent_items)
+    older = _period_stats_from_items(older_items)
+    if recent is None or older is None:
+        raise ValueError("Не удалось собрать статистику из последних матчей.")
+
+    cs2_game = (player.get("games") or {}).get("cs2") or {}
+    current_elo_raw = cs2_game.get("faceit_elo")
+    current_elo: int | None = None
+    if current_elo_raw is not None:
+        try:
+            current_elo = int(_parse_float(current_elo_raw))
+        except ValueError:
+            current_elo = None
+
+    elo_delta: int | None = None
+    if current_elo is not None:
+        elo_delta = (recent.wins - older.wins) * PROGRESS_ELO_PER_WIN
+
+    metrics = _metric_changes(older, recent)
+    improved, declined = _pick_improved_declined(metrics)
+    form_score = compute_form_score(metrics, elo_delta)
+    style = detect_playstyle_from_matches(items)
+    growth_zone = find_growth_zone(items)
+
+    return ProgressReport(
+        style=style,
+        form_score=form_score,
+        older=older,
+        recent=recent,
+        current_elo=current_elo,
+        elo_delta=elo_delta,
+        improved=improved,
+        declined=declined,
+        growth_zone=growth_zone,
+        requested_count=requested_matches,
+        match_count=available,
+        partial_note=partial_note,
+    )
+
+
+def format_progress_report(report: ProgressReport) -> str:
+    lines = [
+        f"📊 Анализ за последние {report.requested_count} матчей",
+    ]
+    if report.partial_note:
+        lines.append(report.partial_note)
+    lines.extend(
+        [
+            "",
+            "📈 ТВОЙ ПРОГРЕСС",
+            "",
+            f"🏅 Стиль: {report.style} | Форма: {report.form_score:.1f}/10",
+            "",
+            f"📊 Последние {report.match_count} матчей:",
+            (
+                f"K/D {_trend_arrow(report.older.kd, report.recent.kd)} "
+                f"{report.older.kd:.2f} → {report.recent.kd:.2f}"
+            ),
+            (
+                f"AVG {_trend_arrow(report.older.avg_kills, report.recent.avg_kills)} "
+                f"{report.older.avg_kills:.0f} → {report.recent.avg_kills:.0f}"
+            ),
+        ]
+    )
+
+    if report.elo_delta is not None:
+        arrow = _trend_arrow(0, float(report.elo_delta))
+        sign = "+" if report.elo_delta > 0 else ""
+        lines.append(f"ELO {arrow} {sign}{report.elo_delta}")
+    elif report.current_elo is not None:
+        lines.append(f"ELO ➡️ {report.current_elo} (текущий)")
+
+    lines.extend(["", "🔥 Прогресс:"])
+
+    if report.improved:
+        lines.append(f"✅ Улучшилось: {', '.join(report.improved)}")
+    else:
+        lines.append("✅ Улучшилось: —")
+
+    if report.declined:
+        lines.append(f"⚠️ Просадка: {', '.join(report.declined)}")
+    else:
+        lines.append("⚠️ Просадка: —")
+
+    lines.extend(["", "🎯 Зона роста:"])
+    lines.append(report.growth_zone or "— недостаточно данных по картам")
 
     return "\n".join(lines)
 
@@ -1622,8 +2194,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         "Привет! Я анализирую матчи Faceit CS2.\n\n"
         "1. Задай свой ник: /setnick ТвойНик\n"
-        "2. Отправь ссылку на матч — проанализирую команду соперников.\n\n"
-        "Сравнение по K/D, ADR и HS% на выбранной карте. "
+        "2. Отправь ссылку на матч — проанализирую команду соперников.\n"
+        "3. /progress — прогресс за 15, 50 или 100 матчей (кнопки).\n\n"
+        "Сравнение по K/D и AVG на выбранной карте. "
         "Точка игрока — по роли в матче или по heatmap (последние игры на карте)."
     )
 
@@ -1649,8 +2222,89 @@ async def setnick_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     touch_user(user_id)
     await update.message.reply_text(
         f"✅ Ник сохранён: {nickname}\n"
-        "Теперь отправь ссылку на матч Faceit CS2."
+        "Теперь отправь ссылку на матч Faceit CS2 или /progress."
     )
+
+
+async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+
+    if not FACEIT_API_KEY:
+        await update.message.reply_text("❌ Не задан FACEIT_API_KEY в bot.py.")
+        return
+
+    user_id = update.effective_user.id
+    purge_inactive_users()
+    touch_user(user_id)
+
+    if not user_nicks.get(user_id):
+        await update.message.reply_text(
+            "❌ Сначала укажи свой Faceit-ник командой:\n"
+            "/setnick ТвойНик"
+        )
+        return
+
+    await update.message.reply_text(
+        "Выбери период для анализа прогресса:",
+        reply_markup=progress_keyboard(),
+    )
+
+
+async def progress_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.from_user:
+        return
+
+    if not query.data.startswith(PROGRESS_CALLBACK_PREFIX):
+        return
+
+    try:
+        requested_matches = int(query.data.removeprefix(PROGRESS_CALLBACK_PREFIX))
+    except ValueError:
+        await query.answer("Неверный выбор", show_alert=True)
+        return
+
+    if requested_matches not in PROGRESS_OPTIONS:
+        await query.answer("Неверный период", show_alert=True)
+        return
+
+    user_id = query.from_user.id
+    purge_inactive_users()
+    touch_user(user_id)
+
+    user_nickname = user_nicks.get(user_id)
+    if not user_nickname:
+        await query.answer("Сначала укажи ник: /setnick", show_alert=True)
+        return
+
+    await query.answer()
+    await query.edit_message_text("⏳ Считаю прогресс...")
+
+    def run_progress() -> str:
+        service = FaceitService(FACEIT_API_KEY)
+        report = build_user_progress(service, user_nickname, requested_matches)
+        return format_progress_report(report)
+
+    try:
+        text = await asyncio.to_thread(run_progress)
+        await query.edit_message_text(text)
+    except FaceitNotFoundError:
+        await query.edit_message_text(
+            "❌ Игрок не найден на Faceit. Проверь ник командой /setnick."
+        )
+    except ConnectionError as exc:
+        await query.edit_message_text(f"❌ {exc}")
+    except FaceitAPIError as exc:
+        code = f" [{exc.status_code}]" if exc.status_code else ""
+        await query.edit_message_text(f"❌ Ошибка Faceit API{code}: {exc.message}")
+    except ValueError as exc:
+        await query.edit_message_text(f"❌ {exc}")
+    except Exception:
+        logger.exception("Неожиданная ошибка при расчёте прогресса")
+        await query.edit_message_text(
+            "❌ Произошла непредвиденная ошибка. Попробуйте позже."
+        )
 
 
 async def handle_match_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1735,6 +2389,8 @@ def build_application() -> Application:
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("setnick", setnick_command))
+    application.add_handler(CommandHandler("progress", progress_command))
+    application.add_handler(CallbackQueryHandler(progress_callback))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_match_link)
     )
