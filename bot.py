@@ -991,7 +991,7 @@ def _resolve_nuke_rotation_main(
 def extract_heatmap_scores(stats: dict[str, Any], map_key: str) -> dict[str, float]:
     """Зоны из heatmap/position полей Faceit API (сегменты и матч-статы)."""
     if map_key not in MAP_VALID_POSITIONS or not stats:
-    return {}
+        return {}
 
     scores: dict[str, float] = {}
     aliases = POSITION_ALIASES.get(map_key, {})
